@@ -18,7 +18,7 @@ More RAM doesn't fix that; idle tools never give theirs back.
 ## Roadmap: from personal tool to universal
 
 ### Language and dependencies
-Rust, chosen for the smallest footprint: a ~670 KB binary and a 4.6 MB daemon (the first Go prototype was
+Rust, chosen for the smallest footprint: a ~670 KB binary at v0.1 (~840 KB at v0.2) and a 4.6 MB daemon (the first Go prototype was
 2.6 MB and 8.3 MB). Dependencies are `libc`, `serde` and `serde_json` only.
 - **sysinfo** was rejected for macOS: it reports RSS, not phys_footprint, and has no pressure or compressor
   breakdown. It is the plan for the Linux backend.
@@ -47,16 +47,20 @@ proc-janitor's grace period (we require 2 min of age).
 - Measured facts: the ~9 MB growth after the first open is ColorSync/AppKit drawing caches, not ramster.
   It stays flat across reopens, and `leaks` reports 0 leaks.
 
-### v0.2: easy to adopt
-- Menu bar: launch at login (SMAppService), Developer ID signing + notarization, app icon
-- Homebrew tap + cargo-dist (universal arm64/amd64 binary, signed and notarized), `cargo install ramster`
-- `ramster setup`: detect installed agents (Claude Code, Codex, Cursor, Gemini CLI, opencode) and offer to register
-  the MCP server and add the CLAUDE.md/AGENTS.md line, with consent per step
-- More rules: local LLM runtimes (Ollama, LM Studio, MLX servers keep multi-GB models loaded), Xcode
-  (SourceKitService, build service), JetBrains IDEs, VS Code extension hosts, Jest/Vitest workers, webpack/vite/Next dev
-  servers, Electron apps
-- Rules as data: `~/.ramster/rules.d/*.json` (match by name/args/path, tier, action) so people can share rule packs
-- Compress history files older than a day
+### v0.2: easy to adopt (done, waiting on a first release)
+- Menu bar: launch at login (SMAppService), app icon, Developer ID signing + notarization (Makefile + release
+  workflow; needs a Developer ID certificate and the GitHub secrets)
+- Universal arm64/x86_64 build, `make dist`, release workflow, Homebrew formula + cask templates
+  (`packaging/homebrew`, to copy into a `homebrew-tap` repo), crate ready for `cargo publish`.
+  We used a small hand-written workflow instead of cargo-dist: it needs no extra tool and handles the
+  .app bundle and notarization, which cargo-dist does not.
+- `ramster setup`: detects Claude Code, Codex, Cursor, Gemini CLI and opencode; registers the MCP server and adds
+  the CLAUDE.md/AGENTS.md line, asking per step, idempotent, with backups and `--remove`
+- More rules: Ollama/LM Studio/llama.cpp/MLX/vLLM, Xcode (SourceKitService, build service), JetBrains IDEs,
+  VS Code-style extension hosts, Jest/Vitest, Next/Vite/webpack/Astro/Nuxt/Storybook/Metro dev servers, Electron apps
+- Rules as data: `~/.ramster/rules.d/*.json` (match by name/args/path/app, tier, when, action), `ramster rules`
+- History files older than a day are gzipped (~14× smaller)
+- Still open: publish (tap repo, crates.io, first tagged release); LICENSE file
 
 ### v0.3: other platforms
 - Linux backend (`sysinfo` or `procfs`): `/proc/*/smaps_rollup` (PSS), `/proc/pressure/memory` (PSI) for pressure, cgroup v2 per systemd unit;
@@ -67,7 +71,6 @@ proc-janitor's grace period (we require 2 min of age).
 - Learn per-user patterns from history ("the emulator is usually idle after 19:00") and suggest at the right time
 - Per-agent accounting: memory per Conductor workspace / agent session, so a multi-agent orchestrator
   can schedule builds instead of running five at once
-- Optional tiny menu bar app reading the same history (status, one-click free)
 
 ### Principles
 - Local only: no telemetry, no network.

@@ -23,19 +23,31 @@ build daemons, emulators, Docker and three browsers on one Mac at the same time.
 ## Install
 
 ```sh
-make install                 # cargo build --release → ~/.local/bin/ramster (override with PREFIX=...)
-# or: cargo install --path .
+brew install wasborntobeawesome/tap/ramster   # prebuilt universal binary (Apple Silicon + Intel)
+# or
+cargo install ramster
+# or from a checkout
+make install                 # → ~/.local/bin/ramster (override with PREFIX=...)
+
+ramster setup                # optional: let your AI agents use it (MCP), asks per step
 ramster agent install        # optional: background sampler at login (launchd)
 ```
 
-Requires macOS (Apple Silicon or Intel) and Rust 1.82+ to build. Linux is on the roadmap ([PLAN.md](PLAN.md)).
+Requires macOS (Apple Silicon or Intel); building needs Rust 1.82+. Linux is on the roadmap ([PLAN.md](PLAN.md)).
 
 ## Menu bar app
 
+Download `ramster-<version>.app.zip` from the [releases](https://github.com/wasborntobeawesome/ramster/releases),
+`brew install --cask wasborntobeawesome/tap/ramster-app`, or build it:
+
 ```sh
-make app                     # → dist/ramster.app (menu bar app + CLI inside, ~1.3 MB)
+make app                     # → dist/ramster.app (menu bar app + CLI inside)
 make install-app             # → ~/Applications/ramster.app
 ```
+
+Turn on **Launch at login** in the menu: ramster registers itself as a login item (`SMAppService`), and
+macOS may ask you to approve it in System Settings → General → Login Items. This needs the app bundle;
+run as a bare binary, the item is greyed out.
 
 A native AppKit status item (Rust + objc2: no SwiftUI, no webview). The title shows memory in use,
 colored by pressure (orange = warning, red = critical). The menu shows top apps, **Free N GB safely**,
@@ -140,7 +152,8 @@ Before starting memory-heavy work (Gradle/Xcode builds, emulators, Docker, big t
 `ramster agent install` writes `~/Library/LaunchAgents/dev.ramster.daemon.plist` and starts `ramster daemon`.
 
 - Samples every 60 s; ~4.6 MB footprint, a few ms of CPU per sample, low-priority I/O.
-- History: `~/.ramster/history/YYYY-MM-DD.ndjson`, about 3 MB a day, kept 7 days.
+- History: `~/.ramster/history/YYYY-MM-DD.ndjson`, about 3 MB a day, kept 7 days. Finished days are
+  gzipped (`.ndjson.gz`, ~14× smaller) with the system `gzip`; ramster reads both forms.
 - Under sustained pressure it shows a notification with the biggest reclaimable items (at most every 30 min).
 - With `"auto_free_safe": true` it frees `safe` items on its own while pressure stays at warning or worse.
 
@@ -229,9 +242,32 @@ make test    # unit tests (rules, report, MCP protocol, real-kernel probe checks
 make lint    # rustfmt + clippy -D warnings
 ```
 
+### Release
+
+1. Bump `version` in `Cargo.toml` (the app's Info.plist version is filled in from it) and commit.
+2. `git tag v0.2.0 && git push --tags`. The `release` workflow builds universal binaries, runs `make dist` and
+   attaches `ramster-<v>-macos-universal.tar.gz`, `ramster-<v>.app.zip` and `SHA256SUMS` to the GitHub release.
+   With the `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`
+   secrets set it signs with your Developer ID (hardened runtime) and notarizes; without them it is ad-hoc signed.
+3. Update `version` and `sha256` in `packaging/homebrew/ramster.rb` (and `ramster-app.rb`) and copy them
+   to the `homebrew-tap` repo.
+4. `cargo publish`.
+
+Locally:
+
+```sh
+make universal                                   # target/universal/{ramster,ramster-bar}
+make app SIGN_ID="Developer ID Application: …"   # hardened runtime + timestamp (ad-hoc if unset)
+make notarize NOTARY_PROFILE=ramster             # after: xcrun notarytool store-credentials ramster …
+make dist [NOTARIZE=1]                           # dist/: CLI tarball, app zip, SHA256SUMS
+make icon                                        # regenerate packaging/ramster.icns
+```
+
 Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules in
 `rules.rs` and `devtools.rs`, rules.d in `custom.rs`, actions, report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
-`src/main.rs` (CLI), `src/bin/ramster-bar.rs` (menu bar app), `packaging/Info.plist`.
+`src/main.rs` (CLI), `src/setup.rs` (`ramster setup`), `src/bin/ramster-bar.rs` (menu bar app),
+`packaging/` (Info.plist, icon generator, Homebrew formula and cask), `contrib/rules.d` (example rule packs),
+`.github/workflows/` (CI, release).
 
 The CLI and daemon don't link AppKit; only `ramster-bar` does. `RAMSTER_BAR_SELFTEST=n` opens and closes
 the menu n times (for screenshots and memory checks); `RAMSTER_BAR_DEBUG=1` logs rebuilds.
