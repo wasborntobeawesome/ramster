@@ -1,0 +1,112 @@
+name: release
+
+# Push a tag that matches Cargo.toml's version (e.g. v0.2.0) to build the
+# universal CLI tarball and the menu bar app, and attach them to a GitHub release.
+#
+# Optional secrets for Developer ID signing + notarization (all skipped when absent;
+# the artifacts are then ad-hoc signed):
+#   MACOS_CERT_P12       base64 of a "Developer ID Application" .p12 (base64 -i cert.p12 | pbcopy)
+#   MACOS_CERT_PASSWORD  password of that .p12
+#   APPLE_ID             Apple ID email used for notarization
+#   APPLE_TEAM_ID        10-character team ID
+#   APPLE_APP_PASSWORD   app-specific password for that Apple ID
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      HAVE_CERT: ${{ secrets.MACOS_CERT_P12 != '' && secrets.MACOS_CERT_PASSWORD != '' }}
+      HAVE_NOTARY: ${{ secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version *= *"\(.*\)"/\1/p' Cargo.toml | head -n1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+            exit 1
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: cargo test --release
+
+      - name: Build universal binaries
+        run: make universal
+
+      - name: Import Developer ID certificate
+        if: env.HAVE_CERT == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/ramster-signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          echo "$MACOS_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          ID=$(security find-identity -v -p codesigning "$KEYCHAIN" | sed -n 's/.*"\(Developer ID Application: .*\)"$/\1/p' | head -n1)
+          if [ -z "$ID" ]; then
+            echo "::error::MACOS_CERT_P12 has no 'Developer ID Application' identity"
+            exit 1
+          fi
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+          echo "SIGN_ID=$ID" >> "$GITHUB_ENV"
+
+      - name: Store notarization credentials
+        if: env.HAVE_CERT == 'true' && env.HAVE_NOTARY == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool store-credentials ramster-ci \
+            --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" \
+            --keychain "$KEYCHAIN"
+          echo "NOTARIZE=1" >> "$GITHUB_ENV"
+
+      - name: Build release artifacts
+        run: |
+          # SIGN_ID (Developer ID, or unset for ad-hoc) and NOTARIZE come from the env.
+          make dist NOTARY_PROFILE=ramster-ci NOTARY_KEYCHAIN="${KEYCHAIN:-}"
+          codesign --verify --strict --verbose=2 dist/ramster.app
+          codesign -dv dist/ramster.app 2>&1 | grep -E 'Authority|Signature|Runtime' || true
+
+      - name: Upload to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --verify-tag --title "ramster $VERSION" --generate-notes
+          fi
+          gh release upload "$GITHUB_REF_NAME" --clobber \
+            "dist/ramster-$VERSION-macos-universal.tar.gz" \
+            "dist/ramster-$VERSION.app.zip" \
+            dist/SHA256SUMS
+
+      - name: SHA-256 (paste into the Homebrew formula / cask)
+        run: |
+          {
+            echo '### SHA-256'
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat dist/SHA256SUMS
+
+      - name: Remove the signing keychain
+        if: always() && env.KEYCHAIN != ''
+        run: security delete-keychain "$KEYCHAIN" || true
