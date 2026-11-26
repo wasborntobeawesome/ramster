@@ -23,7 +23,7 @@ build daemons, emulators, Docker and three browsers on one Mac at the same time.
 ## Install
 
 ```sh
-brew install wasborntobeawesome/tap/ramster   # prebuilt universal binary (Apple Silicon + Intel)
+brew install wasborntobeawesome/tap/ramster   # CLI + menu bar app, prebuilt (Apple Silicon + Intel)
 # or
 cargo install ramster
 # or from a checkout
@@ -37,13 +37,24 @@ Requires macOS (Apple Silicon or Intel); building needs Rust 1.82+. Linux is on 
 
 ## Menu bar app
 
-Download `ramster-<version>.app.zip` from the [releases](https://github.com/wasborntobeawesome/ramster/releases),
-`brew install --cask wasborntobeawesome/tap/ramster-app`, or build it:
+The Homebrew formula includes it; copy it into Applications:
+
+```sh
+cp -R "$(brew --prefix ramster)/ramster.app" ~/Applications/ && open ~/Applications/ramster.app
+```
+
+Or build it from a checkout:
 
 ```sh
 make app                     # → dist/ramster.app (menu bar app + CLI inside)
 make install-app             # → ~/Applications/ramster.app
 ```
+
+ramster isn't signed with an Apple Developer ID yet. Homebrew and source builds aren't affected: macOS only
+checks apps downloaded by a browser. If you download `ramster-<version>.app.zip` from the
+[releases](https://github.com/wasborntobeawesome/ramster/releases) instead, macOS says it can't verify the
+app; allow it once with System Settings → Privacy & Security → **Open Anyway**, or
+`xattr -dr com.apple.quarantine ramster.app`.
 
 Turn on **Launch at login** in the menu: ramster registers itself as a login item (`SMAppService`), and
 macOS may ask you to approve it in System Settings → General → Login Items. This needs the app bundle;
@@ -248,10 +259,13 @@ make lint    # rustfmt + clippy -D warnings
 1. Bump `version` in `Cargo.toml` (the app's Info.plist version is filled in from it) and commit.
 2. `git tag v0.2.0 && git push --tags`. The `release` workflow builds universal binaries, runs `make dist` and
    attaches `ramster-<v>-macos-universal.tar.gz`, `ramster-<v>.app.zip` and `SHA256SUMS` to the GitHub release.
-   With the `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`, `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`
-   secrets set it signs with your Developer ID (hardened runtime) and notarizes; without them it is ad-hoc signed.
-3. Update `version` and `sha256` in `packaging/homebrew/ramster.rb` (and `ramster-app.rb`) and copy them
-   to the `homebrew-tap` repo.
+   No Apple account is needed: without signing secrets the build is ad-hoc signed, which is all the Homebrew
+   formula and `cargo install` need. Later, with a Developer ID, set the `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`,
+   `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` secrets and the workflow also signs with it (hardened
+   runtime) and notarizes, so the downloaded app zip opens without a warning.
+3. Update the version in both URLs and the two `sha256` values (from `SHA256SUMS`) in
+   `packaging/homebrew/ramster.rb`, and copy it to `Formula/ramster.rb` in the `homebrew-tap` repo.
+   (`ramster-app.rb`, a cask, is only for notarized builds: casks are quarantined.)
 4. `cargo publish`.
 
 Locally:

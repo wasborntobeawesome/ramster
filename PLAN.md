@@ -48,9 +48,11 @@ proc-janitor's grace period (we require 2 min of age).
   It stays flat across reopens, and `leaks` reports 0 leaks.
 
 ### v0.2: easy to adopt (done, waiting on a first release)
-- Menu bar: launch at login (SMAppService), app icon, Developer ID signing + notarization (Makefile + release
-  workflow; needs a Developer ID certificate and the GitHub secrets)
-- Universal arm64/x86_64 build, `make dist`, release workflow, Homebrew formula + cask templates
+- Menu bar: launch at login (SMAppService), app icon. Developer ID signing + notarization are wired up
+  (Makefile + release workflow) but optional: there is no Apple account yet
+- Universal arm64/x86_64 build, `make dist`, release workflow, a Homebrew formula with the CLI and the menu bar
+  app (formula installs aren't quarantined, so ad-hoc signing is enough; tested with a local tap) + a cask template
+  for later
   (`packaging/homebrew`, to copy into a `homebrew-tap` repo), crate ready for `cargo publish`.
   We used a small hand-written workflow instead of cargo-dist: it needs no extra tool and handles the
   .app bundle and notarization, which cargo-dist does not.
@@ -60,7 +62,8 @@ proc-janitor's grace period (we require 2 min of age).
   VS Code-style extension hosts, Jest/Vitest, Next/Vite/webpack/Astro/Nuxt/Storybook/Metro dev servers, Electron apps
 - Rules as data: `~/.ramster/rules.d/*.json` (match by name/args/path/app, tier, when, action), `ramster rules`
 - History files older than a day are gzipped (~14× smaller)
-- Still open: publish (tap repo, crates.io, first tagged release); LICENSE file
+- Still open: publish (tap repo, crates.io, first tagged release); LICENSE file. Later: Apple Developer ID so
+  the downloaded app zip and a cask open without a Gatekeeper warning
 
 ### v0.3: other platforms
 - Linux backend (`sysinfo` or `procfs`): `/proc/*/smaps_rollup` (PSS), `/proc/pressure/memory` (PSI) for pressure, cgroup v2 per systemd unit;

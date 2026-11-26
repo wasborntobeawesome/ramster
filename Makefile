@@ -109,7 +109,9 @@ dist:
 	$(if $(filter 1,$(NOTARIZE)),ditto -c -k dist/cli/ramster dist/notarize-cli.zip)
 	$(if $(filter 1,$(NOTARIZE)),$(call notarize_zip,dist/notarize-cli.zip))
 	COPYFILE_DISABLE=1 tar -czf $(CLI_TGZ) -C dist/cli ramster README.md
-	ditto -c -k --keepParent $(APP) $(APP_ZIP)
+	# No resource forks or xattrs: plain unzip (Homebrew) would write them as ._ files into
+	# the bundle and break its signature.
+	ditto -c -k --norsrc --noextattr --noqtn --noacl --keepParent $(APP) $(APP_ZIP)
 	rm -rf dist/cli
 	cd dist && shasum -a 256 $(notdir $(CLI_TGZ)) $(notdir $(APP_ZIP)) | tee SHA256SUMS
 
