@@ -16,7 +16,7 @@ build daemons, emulators, Docker and three browsers on one Mac at the same time.
   and forget, what pressure looks like across the day, and what to change.
 - **AI-friendly**: `--json` on every command, plus an MCP server so your agents can check headroom before
   heavy builds and clean up after themselves.
-- Written in Rust: one ~670 KB binary with three dependencies (`libc`, `serde`, `serde_json`). It reads the
+- Written in Rust: one ~800 KB binary with three dependencies (`libc`, `serde`, `serde_json`). It reads the
   kernel directly (libproc, host_statistics64) without spawning `ps` or `top`; a full scan of ~1,000 processes
   takes about 20 ms. Everything stays on your machine.
 
@@ -94,6 +94,31 @@ NEEDS YOUR OK · 14.9 GB  stops something you may be using · ramster free <id>
 Busy processes (CPU above about 2% right now, or above 1% in recent history) are never suggested.
 
 ## Let your AI agents use it (MCP)
+
+```sh
+ramster setup              # detect your agents, show the plan, ask before each step
+ramster setup --yes        # do every pending step without asking
+ramster setup --dry-run    # only show what would change (also the default when not in a terminal)
+ramster setup --remove     # undo: unregister the MCP server and remove the instruction line
+```
+
+It finds Claude Code, Codex, Cursor, Gemini CLI and opencode, registers the MCP server with each and adds
+the `memory_check` line (below) to the agent's global instructions:
+
+| agent | MCP server | instructions |
+|---|---|---|
+| Claude Code | `claude mcp add --scope user ramster -- <bin> mcp` | `~/.claude/CLAUDE.md` |
+| Codex | `codex mcp add ramster -- <bin> mcp` (or `[mcp_servers.ramster]` in `~/.codex/config.toml`) | `~/.codex/AGENTS.md` |
+| Cursor | `mcpServers.ramster` in `~/.cursor/mcp.json` | printed for you to paste into Settings → Rules → User Rules |
+| Gemini CLI | `mcpServers.ramster` in `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` |
+| opencode | `mcp.ramster` in `~/.config/opencode/opencode.json` | `~/.config/opencode/AGENTS.md` |
+
+Steps already done are skipped, so running it again changes nothing. Before changing a file for the first
+time ramster saves a copy as `<file>.ramster.bak`; other settings keep their order. Config files with
+comments (JSONC) are left alone and ramster prints the snippet to add yourself. Run `make install` first so
+agents point at `~/.local/bin/ramster`, not at a build directory.
+
+Or by hand:
 
 ```sh
 claude mcp add --scope user ramster -- ~/.local/bin/ramster mcp            # Claude Code
