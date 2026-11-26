@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "id": "elasticsearch",
+      "title": "Local Elasticsearch node",
+      "match": {"args": ["org.elasticsearch.bootstrap.Elasticsearch", "org.opensearch.bootstrap.OpenSearch"]},
+      "tier": "confirm",
+      "min_mb": 500,
+      "when": "idle",
+      "action": "term",
+      "tip": "Elasticsearch takes half of RAM up to 31 GB of heap by default. For development, cap it: -Xms1g -Xmx1g in config/jvm.options.d/heap.options (or ES_JAVA_OPTS)."
+    }
+  ]
+}

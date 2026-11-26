@@ -6,33 +6,59 @@ build daemons, emulators, Docker and three browsers on one Mac at the same time.
 - **Sees memory the way macOS does**: footprint plus compressed memory (Activity Monitor's number), not RSS,
   with helpers grouped under their app (WebKit tabs → Safari, the Docker VM → Docker, MCP servers → AI agents).
 - **Knows dev tools**: idle Gradle/Kotlin/Maven daemons, Android emulators, iOS Simulators, the Docker VM,
-  nx/turbo daemons, orphaned MCP and language servers left behind by finished agent sessions, duplicate MCP servers.
+  nx/turbo daemons, orphaned MCP and language servers left behind by finished agent sessions, duplicate MCP servers,
+  loaded local LLMs (Ollama, LM Studio, llama.cpp, MLX, vLLM), Xcode's SourceKit and build services,
+  JetBrains IDEs, VS Code/Cursor extension hosts, idle Next/Vite/webpack/Metro dev servers, Jest/Vitest
+  leftovers and Electron apps. Add your own with [rule packs](#custom-rules).
 - **Frees memory safely**: three tiers (`safe`, `confirm`, `info`). It never touches a busy process, and before
   every signal it checks the process start time so a reused PID is never hit.
 - **Learns your habits**: a tiny background sampler (~4.6 MB RAM, ~3 MB of history a day) shows what you keep open
   and forget, what pressure looks like across the day, and what to change.
 - **AI-friendly**: `--json` on every command, plus an MCP server so your agents can check headroom before
   heavy builds and clean up after themselves.
-- Written in Rust: one ~670 KB binary with three dependencies (`libc`, `serde`, `serde_json`). It reads the
+- Written in Rust: one ~800 KB binary with three dependencies (`libc`, `serde`, `serde_json`). It reads the
   kernel directly (libproc, host_statistics64) without spawning `ps` or `top`; a full scan of ~1,000 processes
   takes about 20 ms. Everything stays on your machine.
 
 ## Install
 
 ```sh
-make install                 # cargo build --release → ~/.local/bin/ramster (override with PREFIX=...)
-# or: cargo install --path .
+brew install wasborntobeawesome/tap/ramster   # CLI + menu bar app, prebuilt (Apple Silicon + Intel)
+# or
+cargo install ramster
+# or from a checkout
+make install                 # → ~/.local/bin/ramster (override with PREFIX=...)
+
+ramster setup                # optional: let your AI agents use it (MCP), asks per step
 ramster agent install        # optional: background sampler at login (launchd)
 ```
 
-Requires macOS (Apple Silicon or Intel) and Rust 1.77+ to build. Linux is on the roadmap ([PLAN.md](PLAN.md)).
+Requires macOS (Apple Silicon or Intel); building needs Rust 1.82+. Linux is on the roadmap ([PLAN.md](PLAN.md)).
 
 ## Menu bar app
 
+The Homebrew formula includes it; copy it into Applications:
+
 ```sh
-make app                     # → dist/ramster.app (menu bar app + CLI inside, ~1.3 MB)
+cp -R "$(brew --prefix ramster)/ramster.app" ~/Applications/ && open ~/Applications/ramster.app
+```
+
+Or build it from a checkout:
+
+```sh
+make app                     # → dist/ramster.app (menu bar app + CLI inside)
 make install-app             # → ~/Applications/ramster.app
 ```
+
+ramster isn't signed with an Apple Developer ID yet. Homebrew and source builds aren't affected: macOS only
+checks apps downloaded by a browser. If you download `ramster-<version>.app.zip` from the
+[releases](https://github.com/wasborntobeawesome/ramster/releases) instead, macOS says it can't verify the
+app; allow it once with System Settings → Privacy & Security → **Open Anyway**, or
+`xattr -dr com.apple.quarantine ramster.app`.
+
+Turn on **Launch at login** in the menu: ramster registers itself as a login item (`SMAppService`), and
+macOS may ask you to approve it in System Settings → General → Login Items. This needs the app bundle;
+run as a bare binary, the item is greyed out.
 
 A native AppKit status item (Rust + objc2: no SwiftUI, no webview). The title shows memory in use,
 colored by pressure (orange = warning, red = critical). The menu shows top apps, **Free N GB safely**,
@@ -60,6 +86,7 @@ ramster free --safe          # free all safe items (idle build daemons, orphaned
 ramster free docker          # free by id or rule name; asks before "confirm" items
 ramster free --all --yes     # everything actionable, no questions
 ramster report --hours 24    # behaviour: pressure over the day, heaviest and "forgotten" apps, advice
+ramster rules                # custom rules loaded from ~/.ramster/rules.d
 ```
 
 Example:
@@ -83,13 +110,38 @@ NEEDS YOUR OK · 14.9 GB  stops something you may be using · ramster free <id>
 
 | tier | meaning | examples |
 |---|---|---|
-| `safe` | restarts on demand, nobody is using it | idle Gradle/Kotlin daemons (not used recently), orphaned MCP/LSP servers, idle nx/turbo daemons, detached processes whose directory was deleted |
-| `confirm` | stops something a human may still want | Android emulator, iOS Simulators, Docker, idle GUI apps, detached node/python processes, Gradle daemons used in the last 20 min |
-| `info` | advice only | browser memory, duplicate MCP servers, agent sessions, missing Gradle idle timeout |
+| `safe` | restarts on demand, nobody is using it | idle Gradle/Kotlin daemons (not used recently), orphaned MCP/LSP servers, idle nx/turbo daemons, detached processes whose directory was deleted, Ollama models idle for 20+ min (reloaded on the next request), Xcode services left over after Xcode quit, leftover Jest/Vitest workers |
+| `confirm` | stops something a human may still want | Android emulator, iOS Simulators, Docker, idle GUI apps, detached node/python processes, Gradle daemons used in the last 20 min, llama.cpp/MLX/vLLM servers, LM Studio models, a bloated SourceKit while Xcode is open, idle dev servers and watch-mode test runners |
+| `info` | advice only | browser memory, duplicate MCP servers, agent sessions, missing Gradle idle timeout, JetBrains IDEs, editor extension hosts (with the heaviest language servers named), Electron apps |
 
 Busy processes (CPU above about 2% right now, or above 1% in recent history) are never suggested.
 
 ## Let your AI agents use it (MCP)
+
+```sh
+ramster setup              # detect your agents, show the plan, ask before each step
+ramster setup --yes        # do every pending step without asking
+ramster setup --dry-run    # only show what would change (also the default when not in a terminal)
+ramster setup --remove     # undo: unregister the MCP server and remove the instruction line
+```
+
+It finds Claude Code, Codex, Cursor, Gemini CLI and opencode, registers the MCP server with each and adds
+the `memory_check` line (below) to the agent's global instructions:
+
+| agent | MCP server | instructions |
+|---|---|---|
+| Claude Code | `claude mcp add --scope user ramster -- <bin> mcp` | `~/.claude/CLAUDE.md` |
+| Codex | `codex mcp add ramster -- <bin> mcp` (or `[mcp_servers.ramster]` in `~/.codex/config.toml`) | `~/.codex/AGENTS.md` |
+| Cursor | `mcpServers.ramster` in `~/.cursor/mcp.json` | printed for you to paste into Settings → Rules → User Rules |
+| Gemini CLI | `mcpServers.ramster` in `~/.gemini/settings.json` | `~/.gemini/GEMINI.md` |
+| opencode | `mcp.ramster` in `~/.config/opencode/opencode.json` | `~/.config/opencode/AGENTS.md` |
+
+Steps already done are skipped, so running it again changes nothing. Before changing a file for the first
+time ramster saves a copy as `<file>.ramster.bak`; other settings keep their order. Config files with
+comments (JSONC) are left alone and ramster prints the snippet to add yourself. Run `make install` first so
+agents point at `~/.local/bin/ramster`, not at a build directory.
+
+Or by hand:
 
 ```sh
 claude mcp add --scope user ramster -- ~/.local/bin/ramster mcp            # Claude Code
@@ -111,7 +163,8 @@ Before starting memory-heavy work (Gradle/Xcode builds, emulators, Docker, big t
 `ramster agent install` writes `~/Library/LaunchAgents/dev.ramster.daemon.plist` and starts `ramster daemon`.
 
 - Samples every 60 s; ~4.6 MB footprint, a few ms of CPU per sample, low-priority I/O.
-- History: `~/.ramster/history/YYYY-MM-DD.ndjson`, about 3 MB a day, kept 7 days.
+- History: `~/.ramster/history/YYYY-MM-DD.ndjson`, about 3 MB a day, kept 7 days. Finished days are
+  gzipped (`.ndjson.gz`, ~14× smaller) with the system `gzip`; ramster reads both forms.
 - Under sustained pressure it shows a notification with the biggest reclaimable items (at most every 30 min).
 - With `"auto_free_safe": true` it frees `safe` items on its own while pressure stays at warning or worse.
 
@@ -130,6 +183,44 @@ Before starting memory-heavy work (Gradle/Xcode builds, emulators, Docker, big t
 ```
 
 `never_touch` matches app names, process names and command lines (case-insensitive substring).
+
+## Custom rules
+
+Drop rule packs into `~/.ramster/rules.d/*.json` to teach ramster about your own tools, and share them
+with your team. Examples are in [contrib/rules.d](contrib/rules.d).
+
+```json
+{
+  "rules": [
+    {
+      "id": "elasticsearch",
+      "title": "Local Elasticsearch node",
+      "match": {"args": ["org.elasticsearch.bootstrap.Elasticsearch", "org.opensearch.bootstrap.OpenSearch"]},
+      "tier": "confirm",
+      "min_mb": 500,
+      "when": "idle",
+      "action": "term",
+      "tip": "Cap the heap for development: -Xms1g -Xmx1g in config/jvm.options.d/heap.options."
+    }
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `id` | rule name; findings get ids like `elasticsearch:1234` (or `chat:slack` for app rules), so `ramster free elasticsearch` works. Must not be a built-in rule name or `all`/`safe`/`confirm`/`info` |
+| `match` | `name` (executable), `args` (command line), `path` (executable path): case-insensitive substrings, a string or a list (any entry matches); `app`: exact app name. Every given field must match. With only `app`, the rule covers the whole app |
+| `tier` | `safe`, `confirm` (default) or `info`. `safe` is only applied when the process is known to be idle; otherwise the finding is `confirm` |
+| `min_mb` | ignore smaller matches (default 100) |
+| `when` | `idle` (default), `detached` (idle and its terminal or agent is gone) or `always` (also when activity is unknown, then as `confirm`; never with `safe`) |
+| `action` | `term` (default, SIGTERM the process tree), `quit` (apps only), `none`, or `{"cmd": ["brew", "services", "stop", "postgresql@16"]}` |
+| `title`, `detail`, `tip` | text shown with the finding |
+
+Whatever a rule says, ramster never suggests a busy process, only signals your own processes, re-checks
+start times before signalling, and honours `never_touch`. When your rule and a built-in rule match the same
+process, yours replaces the built-in one, so nothing is counted or stopped twice. `safe` rules can be freed by agents and by
+`auto_free_safe` without asking, so use it only for things that restart on demand. `ramster rules` lists
+what loaded and points at mistakes; the daemon picks up changes on its next check.
 
 ## How it measures
 
@@ -163,9 +254,35 @@ make test    # unit tests (rules, report, MCP protocol, real-kernel probe checks
 make lint    # rustfmt + clippy -D warnings
 ```
 
-Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules, actions,
-report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
-`src/main.rs` (CLI), `src/bin/ramster-bar.rs` (menu bar app), `packaging/Info.plist`.
+### Release
+
+1. Bump `version` in `Cargo.toml` (the app's Info.plist version is filled in from it) and commit.
+2. `git tag v0.2.0 && git push --tags`. The `release` workflow builds universal binaries, runs `make dist` and
+   attaches `ramster-<v>-macos-universal.tar.gz`, `ramster-<v>.app.zip` and `SHA256SUMS` to the GitHub release.
+   No Apple account is needed: without signing secrets the build is ad-hoc signed, which is all the Homebrew
+   formula and `cargo install` need. Later, with a Developer ID, set the `MACOS_CERT_P12`, `MACOS_CERT_PASSWORD`,
+   `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD` secrets and the workflow also signs with it (hardened
+   runtime) and notarizes, so the downloaded app zip opens without a warning.
+3. Update the version in both URLs and the two `sha256` values (from `SHA256SUMS`) in
+   `packaging/homebrew/ramster.rb`, and copy it to `Formula/ramster.rb` in the `homebrew-tap` repo.
+   (`ramster-app.rb`, a cask, is only for notarized builds: casks are quarantined.)
+4. `cargo publish`.
+
+Locally:
+
+```sh
+make universal                                   # target/universal/{ramster,ramster-bar}
+make app SIGN_ID="Developer ID Application: …"   # hardened runtime + timestamp (ad-hoc if unset)
+make notarize NOTARY_PROFILE=ramster             # after: xcrun notarytool store-credentials ramster …
+make dist [NOTARIZE=1]                           # dist/: CLI tarball, app zip, SHA256SUMS
+make icon                                        # regenerate packaging/ramster.icns
+```
+
+Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules in
+`rules.rs` and `devtools.rs`, rules.d in `custom.rs`, actions, report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
+`src/main.rs` (CLI), `src/setup.rs` (`ramster setup`), `src/bin/ramster-bar.rs` (menu bar app),
+`packaging/` (Info.plist, icon generator, Homebrew formula and cask), `contrib/rules.d` (example rule packs),
+`.github/workflows/` (CI, release).
 
 The CLI and daemon don't link AppKit; only `ramster-bar` does. `RAMSTER_BAR_SELFTEST=n` opens and closes
 the menu n times (for screenshots and memory checks); `RAMSTER_BAR_DEBUG=1` logs rebuilds.

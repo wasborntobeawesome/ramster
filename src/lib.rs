@@ -7,6 +7,7 @@ pub mod daemon;
 pub mod history;
 pub mod mcp;
 pub mod probe;
+pub mod setup;
 pub mod ui;
 pub mod util;
 

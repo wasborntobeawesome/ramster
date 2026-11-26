@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 use crate::analyze::rules::{self, SAFE};
-use crate::analyze::{act, cpu_between, is_system_path, Snapshot};
+use crate::analyze::{act, cpu_between, dev_kind, is_system_path, Snapshot};
 use crate::config::{self, Config};
 use crate::history::{self, Group, ProcRec, Sample, Sys};
 use crate::probe::{self, Proc};
@@ -108,6 +108,8 @@ pub fn to_sample(s: &Snapshot) -> Sample {
                         | "nx daemon"
                         | "turbo daemon"
                 ))
+            // Dev servers, test runners and model runners: idle rules need their history.
+            || (p.uid == me && p.footprint >= 20 << 20 && dev_kind(p).is_some())
             || (p.uid == me
                 && p.ppid == 1
                 && p.footprint >= 20 << 20
@@ -128,6 +130,10 @@ pub fn to_sample(s: &Snapshot) -> Sample {
 fn react(cfg: &Config, snap: &mut Snapshot, last_notify: &mut i64, last_auto: &mut i64) {
     let window = cfg.idle_minutes as i64 * 60;
     snap.attach_history(&history::load(now_unix() - window - 120), window);
+    // Pick up rules.d edits without restarting the sampler.
+    let mut cfg = cfg.clone();
+    (cfg.custom_rules, cfg.rule_errors) = crate::analyze::custom::load(&config::rules_dir());
+    let cfg = &cfg;
     let fs = rules::suggest(snap, cfg);
     let now = now_unix();
 

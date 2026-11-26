@@ -1,6 +1,8 @@
 //! Turns raw processes into app groups, findings and reports.
 
 pub mod act;
+pub mod custom;
+pub mod devtools;
 pub mod facts;
 pub mod report;
 pub mod rules;
@@ -346,9 +348,35 @@ pub fn agent_label(p: &Proc) -> String {
         .unwrap_or_else(|| p.name.clone())
 }
 
+/// Executable name from the path (`comm` is truncated to 15 characters).
+pub fn exe(p: &Proc) -> &str {
+    if p.path.is_empty() {
+        &p.name
+    } else {
+        base_name(&p.path)
+    }
+}
+
+pub const OLLAMA: &str = "Ollama";
+pub const LM_STUDIO: &str = "LM Studio";
+pub const LLM_SERVER: &str = "Local LLM server";
+pub const JEST: &str = "Jest";
+pub const VITEST: &str = "Vitest";
+/// Dev servers recognised by `js_tool`.
+pub const DEV_SERVERS: &[&str] = &[
+    "Next.js dev server",
+    "Vite dev server",
+    "webpack dev server",
+    "Astro dev server",
+    "Nuxt dev server",
+    "Storybook",
+    "Metro bundler",
+];
+
 /// Developer tools that deserve their own bucket.
 pub fn dev_kind(p: &Proc) -> Option<&'static str> {
     let a = p.args.as_str();
+    let x = exe(p);
     if a.contains("org.gradle.launcher.daemon.bootstrap.GradleDaemon") {
         Some("Gradle daemons")
     } else if a.contains("KotlinCompileDaemon") || a.contains("org.jetbrains.kotlin.daemon") {
@@ -366,6 +394,74 @@ pub fn dev_kind(p: &Proc) -> Option<&'static str> {
         Some("nx daemon")
     } else if p.name == "turbo" && a.contains(" daemon") {
         Some("turbo daemon")
+    } else if x == "ollama" || x == "ollama_llama_server" {
+        Some(OLLAMA)
+    } else if p.path.contains("/.lmstudio/") {
+        Some(LM_STUDIO)
+    } else if is_llm_server(x, a) {
+        Some(LLM_SERVER)
+    } else {
+        js_tool(x, a)
+    }
+}
+
+/// llama.cpp, MLX, vLLM and friends serving a local model.
+fn is_llm_server(exe: &str, args: &str) -> bool {
+    matches!(
+        exe,
+        "llama-server" | "llamafile" | "koboldcpp" | "mlx-openai-server"
+    ) || [
+        "mlx_lm.server",
+        "mlx_lm server",
+        "mlx_vlm.server",
+        "vllm serve",
+        "vllm.entrypoints",
+    ]
+    .iter()
+    .any(|m| args.contains(m))
+}
+
+/// JS dev servers and test runners (node, bun or deno running a known CLI).
+fn js_tool(exe: &str, args: &str) -> Option<&'static str> {
+    if !matches!(exe, "node" | "bun" | "deno") {
+        return None;
+    }
+    let toks: Vec<&str> = args.split_whitespace().take(8).collect();
+    let tool = |i: usize| {
+        let b = base_name(toks[i]);
+        b.strip_suffix(".js")
+            .or_else(|| b.strip_suffix(".mjs"))
+            .or_else(|| b.strip_suffix(".cjs"))
+            .unwrap_or(b)
+    };
+    // `name` invoked with one of `subs` (any subcommand when empty, none of `not`).
+    let cmd = |name: &str, subs: &[&str], not: &[&str]| {
+        (0..toks.len()).any(|i| {
+            let next = toks.get(i + 1).copied().unwrap_or("");
+            tool(i) == name && (subs.is_empty() || subs.contains(&next)) && !not.contains(&next)
+        })
+    };
+    // Not the `next-server (vX)` title: `next start` (production) sets it too.
+    if cmd("next", &["dev"], &[]) {
+        Some(DEV_SERVERS[0])
+    } else if cmd("vite", &[], &["build", "preview", "optimize"]) {
+        Some(DEV_SERVERS[1])
+    } else if cmd("webpack-dev-server", &[], &[])
+        || cmd("webpack", &["serve", "--watch", "-w"], &[])
+    {
+        Some(DEV_SERVERS[2])
+    } else if cmd("astro", &["dev"], &[]) {
+        Some(DEV_SERVERS[3])
+    } else if cmd("nuxt", &["dev"], &[]) || cmd("nuxi", &["dev"], &[]) {
+        Some(DEV_SERVERS[4])
+    } else if cmd("storybook", &["dev"], &[]) || cmd("start-storybook", &[], &[]) {
+        Some(DEV_SERVERS[5])
+    } else if cmd("react-native", &["start"], &[]) || cmd("expo", &["start"], &[]) {
+        Some(DEV_SERVERS[6])
+    } else if args.contains("jest-worker/build/") || cmd("jest", &[], &[]) {
+        Some(JEST)
+    } else if args.contains("/vitest/dist/") || cmd("vitest", &[], &[]) {
+        Some(VITEST)
     } else {
         None
     }
@@ -414,3 +510,5 @@ pub fn is_system_path(path: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_v02;

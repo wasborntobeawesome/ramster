@@ -1,0 +1,25 @@
+{
+  "rules": [
+    {
+      "id": "jupyter-kernel",
+      "title": "Idle Jupyter kernel",
+      "match": {"args": "ipykernel_launcher"},
+      "tier": "confirm",
+      "min_mb": 300,
+      "when": "idle",
+      "action": "term",
+      "detail": "stopping it loses the notebook's variables",
+      "tip": "Shut kernels down from the notebook (Kernel → Shut Down) when you're done with them."
+    },
+    {
+      "id": "playwright-browser",
+      "title": "Leftover Playwright browser",
+      "match": {"path": "/ms-playwright/"},
+      "tier": "safe",
+      "min_mb": 150,
+      "when": "detached",
+      "action": "term",
+      "detail": "the test run that launched it is gone"
+    }
+  ]
+}

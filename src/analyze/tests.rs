@@ -12,18 +12,18 @@ use crate::util::{now_unix, uid};
 const MB: u64 = 1 << 20;
 
 /// Facts as if launchctl/lsof found nothing special (tests never shell out).
-fn known_facts() -> Facts {
+pub(super) fn known_facts() -> Facts {
     Facts {
         procs_known: true,
         ..Default::default()
     }
 }
 
-fn run_rules(s: &Snapshot, cfg: &Config) -> Vec<Finding> {
+pub(super) fn run_rules(s: &Snapshot, cfg: &Config) -> Vec<Finding> {
     rules::suggest_with(s, cfg, &known_facts())
 }
 
-fn snap(procs: Vec<Proc>, cpu: &[(i32, f64)]) -> Snapshot {
+pub(super) fn snap(procs: Vec<Proc>, cpu: &[(i32, f64)]) -> Snapshot {
     Snapshot::build(
         procs,
         cpu.iter().copied().collect(),
@@ -35,11 +35,11 @@ fn snap(procs: Vec<Proc>, cpu: &[(i32, f64)]) -> Snapshot {
     )
 }
 
-fn old() -> i64 {
+pub(super) fn old() -> i64 {
     now_unix() - 3 * 3600
 }
 
-fn p(pid: i32, ppid: i32, name: &str, args: &str, mb: u64) -> Proc {
+pub(super) fn p(pid: i32, ppid: i32, name: &str, args: &str, mb: u64) -> Proc {
     Proc {
         pid,
         ppid,
@@ -387,16 +387,19 @@ fn terminal_children_keep_their_own_name() {
     let mut term = p(10, 1, "ghostty", "", 300);
     term.path = "/Applications/Ghostty.app/Contents/MacOS/ghostty".into();
     let shell = p(11, 10, "zsh", "-zsh", 5);
-    let mut vite = p(12, 11, "node", "node vite", 900);
+    let mut server = p(12, 11, "node", "node server.js", 900);
+    server.resp_pid = 10;
+    let mut vite = p(13, 11, "node", "node vite", 900);
     vite.resp_pid = 10;
-    let s = snap(vec![term, shell, vite], &[]);
+    let s = snap(vec![term, shell, server, vite], &[]);
     assert_eq!(s.group_of[&12], "node");
+    assert_eq!(s.group_of[&13], "Vite dev server"); // known dev tools get their own bucket
     assert_eq!(s.group_of[&10], "Ghostty");
 }
 
 // ---- regression tests for review findings ------------------------------------------
 
-fn history_idle(pid: i32, start: i64, cpu_permille: u32) -> Vec<Sample> {
+pub(super) fn history_idle(pid: i32, start: i64, cpu_permille: u32) -> Vec<Sample> {
     let now = now_unix();
     (0..=30)
         .rev()

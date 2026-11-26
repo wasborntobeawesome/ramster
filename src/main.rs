@@ -1,14 +1,14 @@
 //! ramster: see what is eating your RAM, free it safely, and learn your habits.
 
 use serde_json::json;
-use std::io::{BufRead, IsTerminal, Write};
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use ramster::analyze::rules::CONFIRM;
 use ramster::analyze::{self, act, report};
 use ramster::config::Config;
-use ramster::util::{fmt_gb, fmt_mb, now_unix};
-use ramster::{daemon, history, mcp, ui, VERSION};
+use ramster::util::{ask, fmt_gb, fmt_mb, now_unix};
+use ramster::{daemon, history, mcp, setup, ui, VERSION};
 
 const USAGE: &str = "ramster: what is eating your RAM, and how to get it back.
 
@@ -20,15 +20,20 @@ Usage:
   ramster free --safe         free every \"safe\" item (idle build daemons, orphaned MCP/LSP servers)
   ramster free <id|rule>...   free specific items (asks before \"confirm\" items unless --yes)
   ramster report [--hours N]  your usage behaviour over time (needs the daemon)
+  ramster rules               custom rules from ~/.ramster/rules.d and any errors in them
   ramster daemon              run the sampler in the foreground
   ramster agent install       run the sampler in the background at login (launchd)
   ramster agent uninstall|status
   ramster mcp                 MCP server on stdio, so AI agents can check and free memory
+  ramster setup               register the MCP server and a memory_check line with your AI agents
+                              (Claude Code, Codex, Cursor, Gemini CLI, opencode); asks per step
+  ramster setup --remove      undo setup
   ramster version
 
 Flags:
   --json      machine-readable output (for scripts and AI agents)
-  --yes       don't ask before \"confirm\" items
+  --yes       don't ask before \"confirm\" items or setup steps
+  --dry-run   setup: show the plan only
   --force     SIGKILL processes that ignore SIGTERM
 
 Config: ~/.ramster/config.json (created by \"ramster agent install\")
@@ -48,9 +53,11 @@ fn main() {
         "suggest" | "sg" => suggest(json_out),
         "free" | "f" => free(args, json_out),
         "report" | "r" => report_cmd(args, json_out),
+        "rules" => rules_cmd(json_out),
         "daemon" => daemon::run_daemon(Config::load()),
         "agent" => daemon::cmd_agent(args.first().map(String::as_str).unwrap_or("status"), None),
         "mcp" => mcp::serve(VERSION).map_err(|e| e.to_string()),
+        "setup" => setup::cmd(args, json_out),
         "version" | "--version" | "-v" | "-V" => {
             println!("ramster {VERSION}");
             Ok(())
@@ -246,10 +253,33 @@ fn report_cmd(args: Vec<String>, json_out: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn ask(q: &str) -> bool {
-    print!("{q} [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut line = String::new();
-    let _ = std::io::stdin().lock().read_line(&mut line);
-    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+fn rules_cmd(json_out: bool) -> Result<(), String> {
+    let cfg = Config::load();
+    let dir = ramster::config::rules_dir();
+    if json_out {
+        return print_json(&json!({
+            "dir": dir.display().to_string(),
+            "rules": cfg.custom_rules,
+            "errors": cfg.rule_errors,
+        }));
+    }
+    println!("Custom rules in {}", dir.display());
+    if cfg.custom_rules.is_empty() && cfg.rule_errors.is_empty() {
+        println!("  none yet. Drop rule packs (*.json) there; see README \"Custom rules\".");
+    }
+    for r in &cfg.custom_rules {
+        println!(
+            "  {:<24} {:<8} {}",
+            r.id,
+            r.tier,
+            ui::c(ui::DIM, &format!("{} · {}", r.title, r.source))
+        );
+    }
+    for e in &cfg.rule_errors {
+        println!("  {} {e}", ui::c(ui::RED, "✗"));
+    }
+    if !cfg.rule_errors.is_empty() {
+        return Err(format!("{} problem(s) in rules.d", cfg.rule_errors.len()));
+    }
+    Ok(())
 }

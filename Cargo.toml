@@ -8,11 +8,13 @@ repository = "https://github.com/wasborntobeawesome/ramster"
 readme = "README.md"
 keywords = ["memory", "macos", "mcp", "developer-tools", "ram"]
 categories = ["command-line-utilities", "development-tools"]
+# The crate is for `cargo install ramster`; app packaging, icons and CI stay in git.
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/PLAN.md", "/LICENSE*", "/contrib"]
 
 [dependencies]
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
 
 [lib]
 name = "ramster"
@@ -35,5 +37,7 @@ strip = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSAttributedString", "NSDictionary", "NSObject", "NSTimer", "NSDate", "NSRunLoop", "NSThread", "NSGeometry", "NSValue", "NSArray"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSAttributedString", "NSDictionary", "NSObject", "NSTimer", "NSDate", "NSRunLoop", "NSThread", "NSGeometry", "NSValue", "NSArray", "NSError"] }
+# Launch at login (SMAppService) for ramster-bar only.
+objc2-service-management = { version = "0.3", default-features = false, features = ["std", "SMAppService", "objc2", "objc2-foundation"] }
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSResponder", "NSStatusBar", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSMenu", "NSMenuItem", "NSImage", "NSColor", "NSAttributedString", "NSFont", "NSAlert", "NSRunningApplication", "NSWindow", "NSText", "NSParagraphStyle", "NSCell", "NSButtonCell", "NSActionCell", "NSFontDescriptor", "objc2-core-foundation"] }
