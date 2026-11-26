@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::analyze::custom::{self, CustomRule};
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -21,6 +23,12 @@ pub struct Config {
     /// GUI apps ramster may suggest quitting when idle; empty = any not built-in excluded.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub quit_candidates: Vec<String>,
+    /// Rules from ~/.ramster/rules.d/*.json (read by `load`, never written here).
+    #[serde(skip)]
+    pub custom_rules: Vec<CustomRule>,
+    /// Problems found while reading rules.d.
+    #[serde(skip)]
+    pub rule_errors: Vec<String>,
 }
 
 impl Default for Config {
@@ -33,6 +41,8 @@ impl Default for Config {
             auto_free_safe: false,
             never_touch: Vec::new(),
             quit_candidates: Vec::new(),
+            custom_rules: Vec::new(),
+            rule_errors: Vec::new(),
         }
     }
 }
@@ -49,6 +59,11 @@ pub fn path() -> PathBuf {
     home().join("config.json")
 }
 
+/// Rule packs: ~/.ramster/rules.d/*.json
+pub fn rules_dir() -> PathBuf {
+    home().join("rules.d")
+}
+
 impl Config {
     pub fn load() -> Config {
         let mut c: Config = std::fs::read(path())
@@ -58,6 +73,7 @@ impl Config {
         c.interval_sec = c.interval_sec.max(10);
         c.retention_days = c.retention_days.max(1);
         c.idle_minutes = c.idle_minutes.max(1);
+        (c.custom_rules, c.rule_errors) = custom::load(&rules_dir());
         c
     }
 

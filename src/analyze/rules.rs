@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use super::facts::{self, Facts, Need};
-use super::{dev_kind, is_agent, is_system_path, Snapshot};
+use super::{custom, dev_kind, devtools, is_agent, is_system_path, Snapshot};
 use crate::config::Config;
 use crate::probe::{self, Proc};
 use crate::util::{base_name, fmt_mb, fmt_minutes, home, now_unix, slug, tildify, uid};
@@ -57,12 +57,12 @@ impl Finding {
     }
 }
 
-struct Ctx<'a> {
-    s: &'a Snapshot,
-    cfg: &'a Config,
-    facts: &'a Facts,
-    me: u32,
-    now: i64,
+pub(super) struct Ctx<'a> {
+    pub s: &'a Snapshot,
+    pub cfg: &'a Config,
+    pub facts: &'a Facts,
+    pub me: u32,
+    pub now: i64,
 }
 
 type Rule = fn(&Ctx) -> Vec<Finding>;
@@ -105,10 +105,18 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
         other_vms,
         orphans,
         js_daemons,
+        devtools::local_llms,
+        devtools::xcode,
+        devtools::dev_servers,
+        devtools::test_runners,
         idle_apps,
+        custom::run,
         duplicate_mcp,
         agents,
         browsers,
+        devtools::jetbrains,
+        devtools::extension_hosts,
+        devtools::electron,
     ];
     let mut out: Vec<Finding> = Vec::new();
     for rule in rules {
@@ -138,7 +146,7 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
 }
 
 impl Ctx<'_> {
-    fn age(&self, p: &Proc) -> String {
+    pub fn age(&self, p: &Proc) -> String {
         if p.start <= 0 {
             "?".into()
         } else {
@@ -147,7 +155,7 @@ impl Ctx<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn term(
+    pub fn term(
         &self,
         rule: &str,
         root: &Proc,
@@ -180,7 +188,7 @@ impl Ctx<'_> {
 // ---- tiny parsers (instead of a regex dependency) ------------------------------
 
 /// Text right after `marker` up to the first whitespace.
-fn after<'a>(s: &'a str, marker: &str) -> Option<&'a str> {
+pub(super) fn after<'a>(s: &'a str, marker: &str) -> Option<&'a str> {
     let i = s.find(marker)? + marker.len();
     let rest = s[i..].trim_start();
     let tok = rest.split_whitespace().next()?;
@@ -563,7 +571,7 @@ fn is_process_manager(p: &Proc) -> bool {
             .any(|t| NAMES.contains(&base_name(t)))
 }
 
-fn short_cmd(p: &Proc) -> String {
+pub(super) fn short_cmd(p: &Proc) -> String {
     let parts: Vec<&str> = p
         .args
         .split_whitespace()
@@ -726,11 +734,15 @@ const NEVER_QUIT: &[&str] = &[
     "Hotspot Shield",
 ];
 
+/// Apps a dedicated rule already handles better than "quit it".
+const OWN_RULE: &[&str] = &["Ollama", "LM Studio"];
+
 fn idle_apps(c: &Ctx) -> Vec<Finding> {
     let allow = &c.cfg.quit_candidates;
     c.s.groups
         .iter()
         .filter(|g| g.is_app && g.mb >= 800 && !NEVER_QUIT.contains(&g.name.as_str()))
+        .filter(|g| !OWN_RULE.contains(&g.name.as_str()))
         .filter(|g| allow.is_empty() || allow.contains(&g.name))
         .filter_map(|g| {
             let idle = c.s.idle_group(&g.name, c.cfg.idle_minutes);

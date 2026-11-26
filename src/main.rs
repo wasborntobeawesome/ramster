@@ -20,6 +20,7 @@ Usage:
   ramster free --safe         free every \"safe\" item (idle build daemons, orphaned MCP/LSP servers)
   ramster free <id|rule>...   free specific items (asks before \"confirm\" items unless --yes)
   ramster report [--hours N]  your usage behaviour over time (needs the daemon)
+  ramster rules               custom rules from ~/.ramster/rules.d and any errors in them
   ramster daemon              run the sampler in the foreground
   ramster agent install       run the sampler in the background at login (launchd)
   ramster agent uninstall|status
@@ -48,6 +49,7 @@ fn main() {
         "suggest" | "sg" => suggest(json_out),
         "free" | "f" => free(args, json_out),
         "report" | "r" => report_cmd(args, json_out),
+        "rules" => rules_cmd(json_out),
         "daemon" => daemon::run_daemon(Config::load()),
         "agent" => daemon::cmd_agent(args.first().map(String::as_str).unwrap_or("status"), None),
         "mcp" => mcp::serve(VERSION).map_err(|e| e.to_string()),
@@ -243,6 +245,37 @@ fn report_cmd(args: Vec<String>, json_out: bool) -> Result<(), String> {
         return print_json(&serde_json::to_value(&r).map_err(|e| e.to_string())?);
     }
     ui::report(&r);
+    Ok(())
+}
+
+fn rules_cmd(json_out: bool) -> Result<(), String> {
+    let cfg = Config::load();
+    let dir = ramster::config::rules_dir();
+    if json_out {
+        return print_json(&json!({
+            "dir": dir.display().to_string(),
+            "rules": cfg.custom_rules,
+            "errors": cfg.rule_errors,
+        }));
+    }
+    println!("Custom rules in {}", dir.display());
+    if cfg.custom_rules.is_empty() && cfg.rule_errors.is_empty() {
+        println!("  none yet. Drop rule packs (*.json) there; see README \"Custom rules\".");
+    }
+    for r in &cfg.custom_rules {
+        println!(
+            "  {:<24} {:<8} {}",
+            r.id,
+            r.tier,
+            ui::c(ui::DIM, &format!("{} · {}", r.title, r.source))
+        );
+    }
+    for e in &cfg.rule_errors {
+        println!("  {} {e}", ui::c(ui::RED, "✗"));
+    }
+    if !cfg.rule_errors.is_empty() {
+        return Err(format!("{} problem(s) in rules.d", cfg.rule_errors.len()));
+    }
     Ok(())
 }
 
