@@ -4,12 +4,13 @@
 use std::path::PathBuf;
 
 use super::custom::{self, CustomRule};
-use super::rules::{Action, Finding, CONFIRM, INFO, SAFE};
+use super::facts::Facts;
+use super::rules::{self, Action, Finding, CONFIRM, INFO, SAFE};
 use super::tests::{history_idle, p, run_rules, snap};
 use super::*;
 use crate::config::Config;
 use crate::probe::Proc;
-use crate::util::now_unix;
+use crate::util::{now_unix, uid};
 
 fn find<'a>(fs: &'a [Finding], rule: &str) -> Option<&'a Finding> {
     fs.iter().find(|f| f.rule == rule)
@@ -34,7 +35,9 @@ fn dev_kinds() {
         k("node /x/node_modules/.bin/next dev --port 3000"),
         Some(DEV_SERVERS[0])
     );
-    assert_eq!(k("next-server (v15.1.0)"), Some(DEV_SERVERS[0]));
+    // `next start` (production) also titles itself next-server: not a dev server.
+    assert_eq!(k("next-server (v15.1.0)"), None);
+    assert_eq!(k("node /x/node_modules/.bin/next start"), None);
     assert_eq!(
         k("node /x/node_modules/vite/bin/vite.js --host"),
         Some(DEV_SERVERS[1])
@@ -323,9 +326,24 @@ fn test_runner_leftovers() {
             400,
         )
     };
+    // One quiet reading is not proof: ask.
     let fs = run_rules(&snap(vec![worker(20, 1)], &[(20, 0.0)]), &Config::default());
     let f = find(&fs, "test-workers").expect("orphaned workers");
+    assert_eq!(f.safety, CONFIRM);
+    // Quiet for 30 minutes per history, facts gathered, no clients: safe.
+    let w = worker(20, 1);
+    let mut s = snap(vec![w.clone()], &[(20, 0.0)]);
+    s.attach_history(&history_idle(20, w.start, 1), 20 * 60);
+    let f = find(&run_rules(&s, &Config::default()), "test-workers")
+        .cloned()
+        .unwrap();
     assert_eq!(f.safety, SAFE);
+    // Facts not gathered yet: never SAFE.
+    let f = rules::suggest_with(&s, &Config::default(), &Facts::default())
+        .into_iter()
+        .find(|f| f.rule == "test-workers")
+        .unwrap();
+    assert_eq!(f.safety, CONFIRM);
 
     // Watch mode with a live terminal: only once history shows it idle.
     let shell = p(9, 1, "zsh", "-zsh", 5);
@@ -569,4 +587,149 @@ fn contrib_rule_packs_are_valid() {
     let (rules, errors) = custom::load(&dir);
     assert!(errors.is_empty(), "{errors:?}");
     assert!(!rules.is_empty());
+}
+
+// ---- regression tests for the v0.2 review ---------------------------------------------
+
+#[test]
+fn backgrounded_watch_run_is_never_safe() {
+    // `nohup vitest --watch &`, terminal closed, idle between saves.
+    let runner = p(
+        30,
+        1,
+        "node",
+        "node /x/node_modules/.bin/vitest --watch",
+        500,
+    );
+    let mut s = snap(vec![runner.clone()], &[(30, 0.0)]);
+    s.attach_history(&history_idle(30, runner.start, 1), 20 * 60);
+    let fs = run_rules(&s, &Config::default());
+    let f = find(&fs, "test-watch").expect("detached runner offered");
+    assert_eq!(f.safety, CONFIRM);
+    assert!(fs.iter().all(|f| f.safety != SAFE), "{fs:?}");
+    // Started by a LaunchAgent: on purpose, not reported.
+    let mut facts = super::tests::known_facts();
+    facts.launchd_pids.insert(30);
+    let fs = rules::suggest_with(&s, &Config::default(), &facts);
+    assert!(fs.iter().all(|f| !f.pids.contains(&30)), "{fs:?}");
+}
+
+#[test]
+fn small_detached_dev_server_is_still_an_orphan() {
+    // Below the dev-server threshold, but its terminal is gone: the generic rule reports it.
+    let vite = p(40, 1, "node", "node /x/node_modules/.bin/vite", 200);
+    let fs = run_rules(&snap(vec![vite], &[(40, 0.0)]), &Config::default());
+    let f = find(&fs, "detached-process").expect("detached vite");
+    assert_eq!(f.pids, vec![40]);
+    // Above it, the specific rule reports it, once.
+    let vite = p(40, 1, "node", "node /x/node_modules/.bin/vite", 600);
+    let fs = run_rules(&snap(vec![vite], &[(40, 0.0)]), &Config::default());
+    assert!(find(&fs, "dev-server").is_some());
+    assert_eq!(
+        fs.iter().filter(|f| f.pids.contains(&40)).count(),
+        1,
+        "{fs:?}"
+    );
+}
+
+#[test]
+fn custom_and_builtin_rules_never_double_count() {
+    let cfg = Config {
+        custom_rules: vec![rule(
+            r#"{"id": "uvicorn", "match": {"args": "uvicorn"}, "min_mb": 100}"#,
+        )],
+        ..Default::default()
+    };
+    let api = p(50, 1, "python3", "python3 -m uvicorn app:main", 600);
+    let fs = run_rules(&snap(vec![api], &[(50, 0.0)]), &cfg);
+    let hits: Vec<&str> = fs
+        .iter()
+        .filter(|f| f.pids.contains(&50))
+        .map(|f| f.rule.as_str())
+        .collect();
+    assert_eq!(hits, ["uvicorn"], "the user's rule wins, once");
+}
+
+#[test]
+fn custom_rule_with_unknown_activity_is_not_safe() {
+    let r = rule(r#"{"id": "pg", "match": {"name": "postgres"}, "tier": "safe", "when": "idle"}"#);
+    let cfg = Config {
+        custom_rules: vec![r],
+        ..Default::default()
+    };
+    let pg = p(60, 1, "postgres", "postgres -D /x", 400);
+    // Idle now: safe as written.
+    let fs = run_rules(&snap(vec![pg.clone()], &[(60, 0.0)]), &cfg);
+    assert_eq!(find(&fs, "pg").unwrap().safety, SAFE);
+    // `always` with no CPU reading at all: offered, but only as confirm.
+    let cfg = Config {
+        custom_rules: vec![rule(
+            r#"{"id": "pg", "match": {"name": "postgres"}, "when": "always"}"#,
+        )],
+        ..Default::default()
+    };
+    let fs = run_rules(&snap(vec![pg.clone()], &[]), &cfg);
+    assert_eq!(find(&fs, "pg").unwrap().safety, CONFIRM);
+    // and `safe` + `always` is refused outright.
+    let bad: CustomRule = serde_json::from_str(
+        r#"{"id": "pg", "match": {"name": "postgres"}, "tier": "safe", "when": "always"}"#,
+    )
+    .unwrap();
+    assert!(bad.validate().is_err());
+}
+
+#[test]
+fn custom_ids_cannot_shadow_ramster() {
+    for id in [
+        "safe",
+        "all",
+        "confirm",
+        "info",
+        "docker",
+        "dev-server",
+        "a:b",
+    ] {
+        let r: CustomRule =
+            serde_json::from_str(&format!(r#"{{"id": "{id}", "match": {{"name": "x"}}}}"#))
+                .unwrap();
+        assert!(r.validate().is_err(), "{id} accepted");
+    }
+    // One finding per app, each with its own id.
+    let cfg = Config {
+        custom_rules: vec![rule(
+            r#"{"id": "chat", "match": {"app": ["Slack", "Discord"]}, "action": "quit", "min_mb": 100}"#,
+        )],
+        ..Default::default()
+    };
+    let app = |pid, n: &str| {
+        with_path(
+            p(pid, 1, n, "", 500),
+            &format!("/Applications/{n}.app/Contents/MacOS/{n}"),
+        )
+    };
+    let fs = run_rules(
+        &snap(
+            vec![app(70, "Slack"), app(71, "Discord")],
+            &[(70, 0.0), (71, 0.0)],
+        ),
+        &cfg,
+    );
+    let mut ids: Vec<&str> = fs
+        .iter()
+        .filter(|f| f.rule == "chat")
+        .map(|f| f.id.as_str())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["chat:discord", "chat:slack"]);
+}
+
+#[test]
+fn other_users_llm_runtimes_are_ignored() {
+    let mut runner = ollama_runner(41);
+    runner.uid = uid() + 1;
+    let fs = run_rules(
+        &snap(vec![ollama_serve(), runner], &[(41, 0.0)]),
+        &Config::default(),
+    );
+    assert!(find(&fs, "ollama-model").is_none());
 }

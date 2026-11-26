@@ -197,16 +197,17 @@ with your team. Examples are in [contrib/rules.d](contrib/rules.d).
 
 | field | meaning |
 |---|---|
-| `id` | rule name; findings get ids like `elasticsearch:1234`, so `ramster free elasticsearch` works |
+| `id` | rule name; findings get ids like `elasticsearch:1234` (or `chat:slack` for app rules), so `ramster free elasticsearch` works. Must not be a built-in rule name or `all`/`safe`/`confirm`/`info` |
 | `match` | `name` (executable), `args` (command line), `path` (executable path): case-insensitive substrings, a string or a list (any entry matches); `app`: exact app name. Every given field must match. With only `app`, the rule covers the whole app |
-| `tier` | `safe`, `confirm` (default) or `info` |
+| `tier` | `safe`, `confirm` (default) or `info`. `safe` is only applied when the process is known to be idle; otherwise the finding is `confirm` |
 | `min_mb` | ignore smaller matches (default 100) |
-| `when` | `idle` (default), `detached` (idle and its terminal or agent is gone) or `always` |
+| `when` | `idle` (default), `detached` (idle and its terminal or agent is gone) or `always` (also when activity is unknown, then as `confirm`; never with `safe`) |
 | `action` | `term` (default, SIGTERM the process tree), `quit` (apps only), `none`, or `{"cmd": ["brew", "services", "stop", "postgresql@16"]}` |
 | `title`, `detail`, `tip` | text shown with the finding |
 
 Whatever a rule says, ramster never suggests a busy process, only signals your own processes, re-checks
-start times before signalling, and honours `never_touch`. `safe` rules can be freed by agents and by
+start times before signalling, and honours `never_touch`. When your rule and a built-in rule match the same
+process, yours replaces the built-in one, so nothing is counted or stopped twice. `safe` rules can be freed by agents and by
 `auto_free_safe` without asking, so use it only for things that restart on demand. `ramster rules` lists
 what loaded and points at mistakes; the daemon picks up changes on its next check.
 

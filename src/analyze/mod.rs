@@ -441,7 +441,8 @@ fn js_tool(exe: &str, args: &str) -> Option<&'static str> {
             tool(i) == name && (subs.is_empty() || subs.contains(&next)) && !not.contains(&next)
         })
     };
-    if args.contains("next-server") || cmd("next", &["dev"], &[]) {
+    // Not the `next-server (vX)` title: `next start` (production) sets it too.
+    if cmd("next", &["dev"], &[]) {
         Some(DEV_SERVERS[0])
     } else if cmd("vite", &[], &["build", "preview", "optimize"]) {
         Some(DEV_SERVERS[1])

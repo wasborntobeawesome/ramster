@@ -1,14 +1,47 @@
 //! Rules: each looks at a snapshot and proposes findings.
 
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use super::facts::{self, Facts, Need};
-use super::{custom, dev_kind, devtools, is_agent, is_system_path, Snapshot};
+use super::{custom, dev_kind, devtools, is_agent, is_system_path, Idleness, Snapshot};
 use crate::config::Config;
 use crate::probe::{self, Proc};
 use crate::util::{base_name, fmt_mb, fmt_minutes, home, now_unix, slug, tildify, uid};
+
+/// Rule names of the built-in rules (custom rules may not reuse them).
+pub const BUILTIN_RULES: &[&str] = &[
+    "gradle-daemon",
+    "kotlin-daemon",
+    "maven-daemon",
+    "gradle-idle-timeout",
+    "android-emulator",
+    "ios-simulator",
+    "docker",
+    "vm",
+    "orphan-mcp",
+    "orphan-lsp",
+    "detached-process",
+    "nx-daemon",
+    "turbo-daemon",
+    "idle-app",
+    "duplicate-mcp",
+    "agents",
+    "browser",
+    "ollama-model",
+    "llm-server",
+    "lm-studio",
+    "sourcekitservice",
+    "xcbbuildservice",
+    "swbbuildservice",
+    "jetbrains",
+    "extension-host",
+    "dev-server",
+    "test-workers",
+    "test-watch",
+    "electron",
+];
 
 /// Restarts on demand / nobody is using it; no data loss.
 pub const SAFE: &str = "safe";
@@ -97,20 +130,22 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
         me: uid(),
         now: now_unix(),
     };
+    // Order matters: when two rules would act on the same process, the first
+    // one wins (the user's own rules, then specific rules, then generic ones).
     let rules: &[Rule] = &[
+        custom::run,
         build_daemons,
         emulator,
         simulator,
         docker,
-        other_vms,
-        orphans,
-        js_daemons,
         devtools::local_llms,
         devtools::xcode,
         devtools::dev_servers,
         devtools::test_runners,
+        js_daemons,
+        orphans,
         idle_apps,
-        custom::run,
+        other_vms,
         duplicate_mcp,
         agents,
         browsers,
@@ -119,6 +154,8 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
         devtools::electron,
     ];
     let mut out: Vec<Finding> = Vec::new();
+    // Processes an earlier actionable finding already covers.
+    let mut claimed: HashSet<i32> = HashSet::new();
     for rule in rules {
         for f in rule(&c) {
             let mut fields: Vec<&str> = vec![&f.title, &f.detail];
@@ -131,9 +168,16 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
                     }
                 }
             }
-            if !cfg.protected(&fields) {
-                out.push(f);
+            if cfg.protected(&fields) {
+                continue;
             }
+            if f.actionable() {
+                if f.pids.iter().any(|p| claimed.contains(p)) {
+                    continue; // never count or signal the same process twice
+                }
+                claimed.extend(f.pids.iter().copied());
+            }
+            out.push(f);
         }
     }
     let rank = |f: &Finding| match f.safety {
@@ -523,6 +567,17 @@ fn is_interpreter(name: &str) -> bool {
     INTERPRETERS.contains(&name) || (name.starts_with("python3.") && name.len() <= 10)
 }
 
+/// dev_kind buckets that `detached_user_proc` leaves to their own rules.
+const DAEMON_KINDS: &[&str] = &[
+    "Gradle daemons",
+    "Kotlin daemon",
+    "Maven daemon",
+    "Android emulator",
+    "iOS Simulator",
+    "nx daemon",
+    "turbo daemon",
+];
+
 /// A process of ours that was reparented to launchd (its terminal or agent is gone),
 /// excluding apps, system services, dev daemons, agents and process managers.
 fn detached_user_proc(p: &Proc, me: u32, now: i64) -> bool {
@@ -531,16 +586,51 @@ fn detached_user_proc(p: &Proc, me: u32, now: i64) -> bool {
         && p.readable
         && !p.path.contains(".app/Contents/")
         && !is_system_path(&p.path)
-        && dev_kind(p).is_none()
+        // Build daemons, emulators and nx/turbo have their own rules. Dev servers,
+        // test runners and LLM servers do too, but only above their thresholds,
+        // so they stay orphan candidates (duplicates are dropped in suggest_with).
+        && !dev_kind(p).is_some_and(|k| DAEMON_KINDS.contains(&k))
         && p.start > 0
         && now - p.start > 120
         && !is_agent(p)
         && !is_process_manager(p)
 }
 
+/// What we know about a process that lost its parent.
+pub(super) struct OrphanEvidence {
+    /// Idle, launchd/listening facts gathered, and not serving clients.
+    pub proven: bool,
+    /// ", listens on a TCP port ..." / ", not verified yet" / "".
+    pub note: &'static str,
+}
+
 impl Ctx<'_> {
     fn detached_user_proc(&self, p: &Proc) -> bool {
         detached_user_proc(p, self.me, self.now)
+    }
+
+    /// None when a LaunchAgent runs it on purpose (managed, not orphaned).
+    pub(super) fn orphan_evidence(
+        &self,
+        p: &Proc,
+        pids: &[i32],
+        idle: &Idleness,
+    ) -> Option<OrphanEvidence> {
+        if self.facts.launchd_pids.contains(&p.pid) {
+            return None;
+        }
+        let listening = pids.iter().any(|q| self.facts.listening_pids.contains(q));
+        let note = if listening {
+            ", listens on a TCP port (may be a shared server)"
+        } else if !self.facts.procs_known {
+            ", not verified yet"
+        } else {
+            ""
+        };
+        Some(OrphanEvidence {
+            proven: idle.known && idle.idle && self.facts.procs_known && !listening,
+            note,
+        })
     }
 }
 
@@ -595,25 +685,15 @@ fn orphans(c: &Ctx) -> Vec<Finding> {
         if !c.detached_user_proc(p) {
             continue;
         }
-        // Started on purpose by a LaunchAgent: managed, not orphaned.
-        if c.facts.launchd_pids.contains(&p.pid) {
-            continue;
-        }
         let pids = c.s.tree(p.pid);
         let mb = c.s.bytes_of(&pids) >> 20;
         let idle = c.s.idle_procs(&pids, c.cfg.idle_minutes);
         if idle.known && !idle.idle {
             continue; // in use right now
         }
-        let listening = pids.iter().any(|q| c.facts.listening_pids.contains(q));
         // SAFE only when proven: idle, not a launchd job, not serving clients.
-        let proven = idle.known && idle.idle && c.facts.procs_known && !listening;
-        let note = if listening {
-            ", listens on a TCP port (may be a shared server)"
-        } else if !c.facts.procs_known {
-            ", not verified yet"
-        } else {
-            ""
+        let Some(OrphanEvidence { proven, note }) = c.orphan_evidence(p, &pids, &idle) else {
+            continue;
         };
         let tier = if proven { SAFE } else { CONFIRM };
         let short = short_cmd(p);

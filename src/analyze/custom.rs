@@ -25,7 +25,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-use super::rules::{short_cmd, Action, Ctx, Finding, CONFIRM, INFO, SAFE};
+use super::rules::{short_cmd, Action, Ctx, Finding, BUILTIN_RULES, CONFIRM, INFO, SAFE};
 use super::{exe, Idleness};
 use crate::probe::Proc;
 
@@ -140,8 +140,20 @@ impl CustomRule {
     /// Problems that make the rule unusable.
     pub fn validate(&self) -> Result<(), String> {
         let m = &self.matcher;
-        if self.id.trim().is_empty() || self.id.contains(char::is_whitespace) {
+        if self.id.trim().is_empty() || self.id.contains(|c: char| c.is_whitespace() || c == ':') {
             return Err("\"id\" must be a non-empty word like \"my-server\"".into());
+        }
+        // `ramster free <word>` selects by id, rule, tier or "all".
+        if ["all", SAFE, CONFIRM, INFO].contains(&self.id.as_str())
+            || BUILTIN_RULES.contains(&self.id.as_str())
+        {
+            return Err(format!(
+                "\"id\" {:?} is taken by ramster itself; pick another name",
+                self.id
+            ));
+        }
+        if self.tier == SAFE && self.when == When::Always {
+            return Err("\"tier\": \"safe\" needs proof that nobody uses it; use \"when\": \"idle\" or \"detached\"".into());
         }
         if m.name.is_none() && m.args.is_none() && m.path.is_none() && m.app.is_none() {
             return Err("\"match\" needs at least one of name, args, path, app".into());
@@ -242,6 +254,7 @@ fn proc_matches(c: &Ctx, r: &CustomRule, p: &Proc) -> bool {
     name_ok && args_ok && path_ok && app_ok
 }
 
+/// `always` still never means busy; with unknown activity it is offered as `confirm`.
 fn wanted(r: &CustomRule, idle: &Idleness, detached: bool) -> bool {
     if idle.known && !idle.idle {
         return false; // never interrupt work, whatever the rule says
@@ -264,9 +277,11 @@ fn act_of(r: &CustomRule) -> (Action, String) {
     }
 }
 
-fn tier(r: &CustomRule) -> &'static str {
+/// The rule's tier; `safe` only when we actually know the process is idle.
+fn tier(r: &CustomRule, idle: &Idleness) -> &'static str {
     match r.tier.as_str() {
-        SAFE => SAFE,
+        SAFE if idle.known && idle.idle => SAFE,
+        SAFE => CONFIRM,
         INFO => INFO,
         _ => CONFIRM,
     }
@@ -305,7 +320,7 @@ pub(super) fn run(c: &Ctx) -> Vec<Finding> {
                 detail = format!("{}, {detail}", r.detail);
             }
             let (act, action) = act_of(r);
-            let mut f = c.term(&r.id, p, pids, tier(r), title, detail, &action);
+            let mut f = c.term(&r.id, p, pids, tier(r, &idle), title, detail, &action);
             f.act = act;
             f.tip = r.tip.clone();
             out.push(f);
@@ -344,9 +359,9 @@ fn app_rule(c: &Ctx, r: &CustomRule) -> Vec<Finding> {
                 detail = format!("{}, {detail}", r.detail);
             }
             Some(Finding {
-                id: r.id.clone(),
+                id: format!("{}:{}", r.id, crate::util::slug(&g.name)),
                 rule: r.id.clone(),
-                safety: tier(r),
+                safety: tier(r, &idle),
                 title: if r.title.is_empty() {
                     format!("{} uses {}", g.name, crate::util::fmt_mb(g.mb))
                 } else {

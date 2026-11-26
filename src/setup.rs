@@ -211,8 +211,11 @@ pub fn json_edit(text: &str, key: &str, value: Option<&Value>) -> Result<Option<
             let servers = servers
                 .as_object_mut()
                 .ok_or(format!("has a \"{key}\" that is not an object"))?;
-            if servers.contains_key(NAME) {
-                return Ok(None);
+            if let Some(old) = servers.get(NAME) {
+                if json_command(old) == json_command(v) {
+                    return Ok(None);
+                }
+                // Points at another binary (an old build, a removed Homebrew version): update it.
             }
             servers.insert(NAME.into(), v.clone());
         }
@@ -233,6 +236,15 @@ pub fn json_edit(text: &str, key: &str, value: Option<&Value>) -> Result<Option<
     let mut out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     out.push('\n');
     Ok(Some(out))
+}
+
+/// The program a registration runs: `"command": "..."` or `"command": ["...", ...]`.
+fn json_command(v: &Value) -> Option<&str> {
+    match v.get("command")? {
+        Value::String(s) => Some(s),
+        Value::Array(a) => a.first()?.as_str(),
+        _ => None,
+    }
 }
 
 /// `[mcp_servers.ramster]` or one of its subtables (`[mcp_servers.ramster.env]`).
@@ -272,13 +284,50 @@ fn tidy_end(s: &str) -> String {
     }
 }
 
-pub fn toml_add(text: &str, bin: &str) -> Option<String> {
-    if text.lines().any(is_ramster_table) {
+/// `command = "..."` of `[mcp_servers.ramster]`.
+fn toml_command(text: &str) -> Option<String> {
+    let mut inside = false;
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            inside = t.replace([' ', '"'], "") == "[mcp_servers.ramster]";
+            continue;
+        }
+        if !inside {
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("command") else {
+            continue;
+        };
+        let v = rest.trim_start().strip_prefix('=')?.trim();
+        let v = v.strip_prefix('"')?;
+        let mut out = String::new();
+        let mut chars = v.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => out.push(chars.next()?),
+                '"' => return Some(out),
+                _ => out.push(ch),
+            }
+        }
         return None;
     }
+    None
+}
+
+/// Add `[mcp_servers.ramster]`, or rewrite it when it runs a different binary.
+pub fn toml_add(text: &str, bin: &str) -> Option<String> {
+    let base = if text.lines().any(is_ramster_table) {
+        if toml_command(text).as_deref() == Some(bin) {
+            return None;
+        }
+        toml_remove(text)?
+    } else {
+        text.to_string()
+    };
     Some(format!(
         "{}[mcp_servers.{NAME}]\ncommand = {}\nargs = [\"mcp\"]\n",
-        blank_line_after(text),
+        blank_line_after(&base),
         toml_str(bin)
     ))
 }
@@ -373,6 +422,18 @@ impl Step {
         })
     }
 
+    /// Is there a ramster entry in the file at all (current or stale)?
+    fn registered(&self, file: &Path) -> bool {
+        let text = read(file).unwrap_or_default();
+        match &self.edit {
+            Edit::Json { key, .. } => serde_json::from_str::<Value>(&text)
+                .ok()
+                .is_some_and(|v| v.get(key).and_then(|s| s.get(NAME)).is_some()),
+            Edit::Toml { .. } => text.lines().any(is_ramster_table),
+            Edit::Line => false,
+        }
+    }
+
     pub fn status(&self, remove: bool) -> Status {
         let Some(file) = &self.file else {
             return Status::Manual(self.action(remove));
@@ -421,6 +482,11 @@ impl Step {
             Via::Manual(..) => Err(self.action(remove)),
             Via::Cli(prog, add, rm) => {
                 backup(file)?;
+                if !remove && self.registered(file) {
+                    // Registered with another binary; the CLIs refuse to add over it.
+                    let rm: Vec<&str> = rm.iter().map(String::as_str).collect();
+                    let _ = run(Duration::from_secs(60), prog, &rm);
+                }
                 let args: Vec<&str> = (if remove { rm } else { add })
                     .iter()
                     .map(String::as_str)
@@ -444,6 +510,27 @@ impl Step {
 
 // ---- command ----------------------------------------------------------------
 
+/// A path to this binary that survives upgrades. Homebrew runs us from a
+/// versioned Cellar directory that `brew cleanup` deletes; register the
+/// `opt` or `bin` symlink instead.
+pub fn stable_bin(exe: &Path) -> String {
+    let real = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
+    let r = real.to_string_lossy().into_owned();
+    if let Some(i) = r.find("/Cellar/") {
+        let prefix = &r[..i];
+        let name = base_name(&r);
+        for cand in [
+            format!("{prefix}/opt/{NAME}/bin/{name}"),
+            format!("{prefix}/bin/{name}"),
+        ] {
+            if Path::new(&cand).exists() {
+                return cand;
+            }
+        }
+    }
+    r
+}
+
 fn take(args: &mut Vec<String>, names: &[&str]) -> bool {
     let before = args.len();
     args.retain(|a| !names.contains(&a.as_str()));
@@ -460,11 +547,7 @@ pub fn cmd(mut args: Vec<String>, json_out: bool) -> Result<(), String> {
             "unknown argument {bad}\nusage: ramster setup [--yes] [--dry-run] [--remove] [--json]"
         ));
     }
-    let bin = std::env::current_exe()
-        .and_then(|p| p.canonicalize())
-        .map_err(|e| e.to_string())?
-        .to_string_lossy()
-        .into_owned();
+    let bin = stable_bin(&std::env::current_exe().map_err(|e| e.to_string())?);
     let home = PathBuf::from(crate::util::home());
     let (agents, steps) = plan(&home, &bin, &|n| which(n, &[]));
     let status: Vec<Status> = steps.iter().map(|s| s.status(remove)).collect();
@@ -628,6 +711,51 @@ mod tests {
     }
 
     #[test]
+    fn stale_json_registration_is_updated() {
+        let old = r#"{"mcpServers": {"ramster": {"type": "stdio", "command": "/opt/homebrew/Cellar/ramster/0.2.0/bin/ramster", "args": ["mcp"]}, "x": {}}}"#;
+        let v = json!({"command": "/opt/homebrew/opt/ramster/bin/ramster", "args": ["mcp"]});
+        let out = json_edit(old, "mcpServers", Some(&v)).unwrap().unwrap();
+        assert!(out.contains("/opt/homebrew/opt/ramster/bin/ramster"));
+        assert!(!out.contains("Cellar"));
+        // Same binary with Claude's extra fields: already done.
+        let same = r#"{"mcpServers": {"ramster": {"type": "stdio", "command": "/b/ramster", "args": ["mcp"], "env": {}}}}"#;
+        let v = json!({"command": "/b/ramster", "args": ["mcp"]});
+        assert_eq!(json_edit(same, "mcpServers", Some(&v)).unwrap(), None);
+        // opencode's array form.
+        let oc = r#"{"mcp": {"ramster": {"type": "local", "command": ["/b/ramster", "mcp"]}}}"#;
+        let v = json!({"type": "local", "command": ["/b/ramster", "mcp"], "enabled": true});
+        assert_eq!(json_edit(oc, "mcp", Some(&v)).unwrap(), None);
+    }
+
+    #[test]
+    fn homebrew_cellar_path_becomes_opt_symlink() {
+        let home = temp_home("cellar");
+        let cellar = home.join("Cellar/ramster/0.2.0/bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        std::fs::write(cellar.join("ramster"), "").unwrap();
+        let opt = home.join("opt/ramster");
+        std::fs::create_dir_all(home.join("opt")).unwrap();
+        std::os::unix::fs::symlink(home.join("Cellar/ramster/0.2.0"), &opt).unwrap();
+        let via_bin = home.join("bin");
+        std::fs::create_dir_all(&via_bin).unwrap();
+        std::os::unix::fs::symlink(cellar.join("ramster"), via_bin.join("ramster")).unwrap();
+        let got = stable_bin(&via_bin.join("ramster"));
+        let real_home = home.canonicalize().unwrap();
+        assert_eq!(
+            got,
+            format!("{}/opt/ramster/bin/ramster", real_home.display())
+        );
+        // Not Homebrew: the real path.
+        let plain = home.join("plain");
+        std::fs::write(&plain, "").unwrap();
+        assert_eq!(
+            stable_bin(&plain),
+            plain.canonicalize().unwrap().to_string_lossy()
+        );
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn json_refuses_jsonc() {
         let text = "{\n  // my servers\n  \"mcp\": {}\n}\n";
         assert!(json_edit(text, "mcp", Some(&json!({}))).is_err());
@@ -646,7 +774,11 @@ mod tests {
                 "{orig}\n[mcp_servers.ramster]\ncommand = \"/u/bin/ramster\"\nargs = [\"mcp\"]\n"
             )
         );
-        assert_eq!(toml_add(&added, "/other"), None);
+        assert_eq!(toml_add(&added, "/u/bin/ramster"), None);
+        // Registered with another binary: rewritten in place, not duplicated.
+        let moved = toml_add(&added, "/other/ramster").unwrap();
+        assert_eq!(toml_command(&moved).as_deref(), Some("/other/ramster"));
+        assert_eq!(moved.matches("[mcp_servers.ramster]").count(), 1);
         assert_eq!(toml_remove(&added).unwrap(), orig);
         assert_eq!(toml_remove(orig), None);
         // In the middle, with a subtable, as `codex mcp add` might write it.

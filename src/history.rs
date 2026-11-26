@@ -153,8 +153,8 @@ pub fn prune(retention_days: u32) {
 }
 
 /// Gzip day files from before today that haven't been written to for 10
-/// minutes (about 3 MB a day shrinks ~10x). A day that already has a `.gz`
-/// (a late write after compression) is left alone; `load_from` reads both.
+/// minutes (about 3 MB a day shrinks ~10x). A day that also has a `.gz` (a late
+/// write after compression, or an interrupted gzip) is merged into one file first.
 pub fn compress_in(dir: &Path, now: i64) {
     let today = local_date(now);
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -174,10 +174,14 @@ pub fn compress_in(dir: &Path, now: i64) {
             .ok()
             .and_then(|m| m.elapsed().ok())
             .is_some_and(|age| age > Duration::from_secs(600));
-        if !settled || dir.join(format!("{name}.gz")).exists() {
+        if !settled {
             continue;
         }
         let path = e.path();
+        let gz = dir.join(format!("{name}.gz"));
+        if gz.exists() && !merge_gz_into(&gz, &path) {
+            continue;
+        }
         let (ok, out) = run(
             Duration::from_secs(120),
             gzip(),
@@ -185,8 +189,43 @@ pub fn compress_in(dir: &Path, now: i64) {
         );
         if !ok {
             eprintln!("gzip {}: {out}", path.display());
+            // gzip removes the plain file only on success; a partial .gz must
+            // not stay next to it.
+            if path.exists() {
+                let _ = std::fs::remove_file(&gz);
+            }
         }
     }
+}
+
+/// A day in both forms (a late write after compression, or an interrupted
+/// gzip): append what the `.gz` holds to the plain file and drop the `.gz`, so
+/// the day can be compressed again as one file. Duplicates are fine: loading
+/// dedups by timestamp. A truncated `.gz` contributes what is readable.
+fn merge_gz_into(gz: &Path, plain: &Path) -> bool {
+    let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(plain) else {
+        return false;
+    };
+    // Start on a fresh line in case the plain file ends mid-line.
+    if f.write_all(b"\n").is_err() {
+        return false;
+    }
+    let Ok(out) = f.try_clone() else {
+        return false;
+    };
+    let ran = Command::new(gzip())
+        .arg("-dc")
+        .arg(gz)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::null())
+        .status();
+    // A corrupt archive still yields its readable prefix; only a failure to
+    // run gzip at all leaves the files alone.
+    if ran.is_err() || f.write_all(b"\n").is_err() {
+        return false;
+    }
+    std::fs::remove_file(gz).is_ok()
 }
 
 /// Delete day files (plain or gzipped) older than the retention window.
@@ -346,7 +385,7 @@ mod tests {
         // Finished day, but written to moments ago: wait for it to settle.
         let fresh = write_day(&dir, &day(d1), &[d1], 0);
         let today = write_day(&dir, &day(now), &[now], 3600);
-        // A day in both forms (late write after compression): left alone, read from both.
+        // A day in both forms (late write after compression): merged, then compressed.
         let both = write_day(&dir, &day(d2), &[d2, d2 + 60], 3600);
         assert!(
             run(
@@ -362,13 +401,52 @@ mod tests {
 
         assert!(!old.exists());
         assert!(dir.join(format!("{}.gz", day(d3))).exists());
-        assert!(fresh.exists() && today.exists() && both.exists());
+        assert!(fresh.exists() && today.exists() && !both.exists());
+        assert!(dir.join(format!("{}.gz", day(d2))).exists());
         assert!(!dir.join(format!("{}.gz", day(d1))).exists());
         assert!(!dir.join(format!("{}.gz", day(now))).exists());
         assert_eq!(
             times(&load_from(&dir, d3 - 10)),
             vec![d3, d2, d2 + 60, d2 + 120, d1, now]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncated_gz_is_merged_not_stuck() {
+        let dir = temp_dir("hist-truncated");
+        let now = now_unix();
+        let d = now - 2 * 86_400;
+        let name = format!("{}.ndjson", local_date(d));
+        let many: Vec<i64> = (0..400).map(|i| d + i * 60).collect();
+        let plain = write_day(&dir, &name, &many, 3600);
+        assert!(
+            run(
+                Duration::from_secs(10),
+                gzip(),
+                &["-f", &plain.to_string_lossy()]
+            )
+            .0
+        );
+        // Interrupted gzip: half an archive next to a plain file.
+        let gz = dir.join(format!("{name}.gz"));
+        let bytes = std::fs::read(&gz).unwrap();
+        std::fs::write(&gz, &bytes[..bytes.len() / 2]).unwrap();
+        write_day(&dir, &name, &[d + 400 * 60], 3600);
+
+        compress_in(&dir, now);
+
+        assert!(!plain.exists() && gz.exists(), "one compressed file again");
+        let got = times(&load_from(&dir, d - 10));
+        assert!(
+            got.contains(&(d + 400 * 60)),
+            "the plain file's samples survive"
+        );
+        // Whatever part of the broken archive was readable is kept too (here maybe none).
+        assert!(!got.is_empty() && got.len() <= 401, "{}", got.len());
+        // And the next pass leaves the day alone.
+        compress_in(&dir, now);
+        assert!(!plain.exists() && gz.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

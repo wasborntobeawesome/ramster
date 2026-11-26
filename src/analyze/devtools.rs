@@ -28,7 +28,7 @@ fn idle_for_long(i: &super::Idleness) -> bool {
 
 pub(super) fn local_llms(c: &Ctx) -> Vec<Finding> {
     let mut out = Vec::new();
-    for p in &c.s.procs {
+    for p in c.s.procs.iter().filter(|p| p.uid == c.me && p.readable) {
         let runner = is_ollama_runner(p);
         if !runner && dev_kind(p) != Some(LLM_SERVER) {
             continue;
@@ -171,6 +171,15 @@ fn lm_studio(c: &Ctx) -> Vec<Finding> {
     let Some(g) = c.s.group(LM_STUDIO).filter(|g| g.mb >= 1500) else {
         return vec![];
     };
+    // Only another user's LM Studio: nothing we could stop.
+    if !g
+        .pids
+        .iter()
+        .filter_map(|&p| c.s.proc(p))
+        .any(|p| p.uid == c.me)
+    {
+        return vec![];
+    }
     let mut idle = c.s.idle_group(&g.name, c.cfg.idle_minutes);
     if !idle.known {
         idle = c.s.idle_procs(&g.pids, c.cfg.idle_minutes);
@@ -447,6 +456,14 @@ pub(super) fn dev_servers(c: &Ctx) -> Vec<Finding> {
         if !(idle_for_long(&idle) || (detached && idle.known && idle.idle)) {
             continue;
         }
+        let evidence = if detached {
+            match c.orphan_evidence(p, &pids, &idle) {
+                Some(e) => Some(e),
+                None => continue, // a LaunchAgent runs it on purpose
+            }
+        } else {
+            None
+        };
         let cwd = probe::cwd(p.pid);
         let gone = dir_gone(&cwd);
         let mut why = Vec::new();
@@ -469,8 +486,11 @@ pub(super) fn dev_servers(c: &Ctx) -> Vec<Finding> {
         } else {
             format!("{kind} for {name}")
         };
+        if let Some(e) = &evidence {
+            detail += e.note;
+        }
         // Nobody can be developing in a deleted directory.
-        let safety = if gone && detached && idle.known && idle.idle {
+        let safety = if gone && evidence.is_some_and(|e| e.proven) {
             SAFE
         } else {
             CONFIRM
@@ -506,20 +526,42 @@ pub(super) fn test_runners(c: &Ctx) -> Vec<Finding> {
             format!(" in {name}")
         };
         if p.ppid == 1 {
-            // The run that owned them is gone; test workers hold no state.
-            let safety = if idle.known { SAFE } else { CONFIRM };
-            out.push(c.term(
-                "test-workers",
-                p,
-                pids,
-                safety,
-                format!("Leftover {kind} workers{at}"),
-                format!(
-                    "the test run that started them is gone, up {}, {idle}",
-                    c.age(p)
-                ),
-                "stop them; test workers hold no state",
-            ));
+            let Some(e) = c.orphan_evidence(p, &pids, &idle) else {
+                continue; // a LaunchAgent runs it on purpose
+            };
+            if is_test_worker(&p.args) {
+                // The run that owned them is gone; workers hold no state. SAFE needs
+                // history, the launchd/listening facts, and no clients.
+                let safety = if e.proven && idle_for_long(&idle) {
+                    SAFE
+                } else {
+                    CONFIRM
+                };
+                out.push(c.term(
+                    "test-workers",
+                    p,
+                    pids,
+                    safety,
+                    format!("Leftover {kind} workers{at}"),
+                    format!(
+                        "the test run that started them is gone, up {}, {idle}{}",
+                        c.age(p),
+                        e.note
+                    ),
+                    "stop them; test workers hold no state",
+                ));
+            } else if idle.known {
+                // The runner itself, detached: maybe a watch run someone backgrounded.
+                out.push(c.term(
+                    "test-watch",
+                    p,
+                    pids,
+                    CONFIRM,
+                    format!("Detached {kind} run{at}"),
+                    format!("its terminal is gone, up {}, {idle}{}", c.age(p), e.note),
+                    "stop it (SIGTERM); start it again when you test",
+                ));
+            }
         } else if idle_for_long(&idle) {
             out.push(c.term(
                 "test-watch",
@@ -533,6 +575,13 @@ pub(super) fn test_runners(c: &Ctx) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// Worker processes (as opposed to the jest/vitest command itself).
+fn is_test_worker(args: &str) -> bool {
+    args.contains("jest-worker/build/")
+        || args.contains("/vitest/dist/")
+        || args.contains("tinypool")
 }
 
 // ---- Electron apps -------------------------------------------------------------------------
