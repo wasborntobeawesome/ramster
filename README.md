@@ -6,7 +6,10 @@ build daemons, emulators, Docker and three browsers on one Mac at the same time.
 - **Sees memory the way macOS does**: footprint plus compressed memory (Activity Monitor's number), not RSS,
   with helpers grouped under their app (WebKit tabs → Safari, the Docker VM → Docker, MCP servers → AI agents).
 - **Knows dev tools**: idle Gradle/Kotlin/Maven daemons, Android emulators, iOS Simulators, the Docker VM,
-  nx/turbo daemons, orphaned MCP and language servers left behind by finished agent sessions, duplicate MCP servers.
+  nx/turbo daemons, orphaned MCP and language servers left behind by finished agent sessions, duplicate MCP servers,
+  loaded local LLMs (Ollama, LM Studio, llama.cpp, MLX, vLLM), Xcode's SourceKit and build services,
+  JetBrains IDEs, VS Code/Cursor extension hosts, idle Next/Vite/webpack/Metro dev servers, Jest/Vitest
+  leftovers and Electron apps. Add your own with [rule packs](#custom-rules).
 - **Frees memory safely**: three tiers (`safe`, `confirm`, `info`). It never touches a busy process, and before
   every signal it checks the process start time so a reused PID is never hit.
 - **Learns your habits**: a tiny background sampler (~4.6 MB RAM, ~3 MB of history a day) shows what you keep open
@@ -25,7 +28,7 @@ make install                 # cargo build --release → ~/.local/bin/ramster (o
 ramster agent install        # optional: background sampler at login (launchd)
 ```
 
-Requires macOS (Apple Silicon or Intel) and Rust 1.77+ to build. Linux is on the roadmap ([PLAN.md](PLAN.md)).
+Requires macOS (Apple Silicon or Intel) and Rust 1.82+ to build. Linux is on the roadmap ([PLAN.md](PLAN.md)).
 
 ## Menu bar app
 
@@ -60,6 +63,7 @@ ramster free --safe          # free all safe items (idle build daemons, orphaned
 ramster free docker          # free by id or rule name; asks before "confirm" items
 ramster free --all --yes     # everything actionable, no questions
 ramster report --hours 24    # behaviour: pressure over the day, heaviest and "forgotten" apps, advice
+ramster rules                # custom rules loaded from ~/.ramster/rules.d
 ```
 
 Example:
@@ -83,9 +87,9 @@ NEEDS YOUR OK · 14.9 GB  stops something you may be using · ramster free <id>
 
 | tier | meaning | examples |
 |---|---|---|
-| `safe` | restarts on demand, nobody is using it | idle Gradle/Kotlin daemons (not used recently), orphaned MCP/LSP servers, idle nx/turbo daemons, detached processes whose directory was deleted |
-| `confirm` | stops something a human may still want | Android emulator, iOS Simulators, Docker, idle GUI apps, detached node/python processes, Gradle daemons used in the last 20 min |
-| `info` | advice only | browser memory, duplicate MCP servers, agent sessions, missing Gradle idle timeout |
+| `safe` | restarts on demand, nobody is using it | idle Gradle/Kotlin daemons (not used recently), orphaned MCP/LSP servers, idle nx/turbo daemons, detached processes whose directory was deleted, Ollama models idle for 20+ min (reloaded on the next request), Xcode services left over after Xcode quit, leftover Jest/Vitest workers |
+| `confirm` | stops something a human may still want | Android emulator, iOS Simulators, Docker, idle GUI apps, detached node/python processes, Gradle daemons used in the last 20 min, llama.cpp/MLX/vLLM servers, LM Studio models, a bloated SourceKit while Xcode is open, idle dev servers and watch-mode test runners |
+| `info` | advice only | browser memory, duplicate MCP servers, agent sessions, missing Gradle idle timeout, JetBrains IDEs, editor extension hosts (with the heaviest language servers named), Electron apps |
 
 Busy processes (CPU above about 2% right now, or above 1% in recent history) are never suggested.
 
@@ -131,6 +135,43 @@ Before starting memory-heavy work (Gradle/Xcode builds, emulators, Docker, big t
 
 `never_touch` matches app names, process names and command lines (case-insensitive substring).
 
+## Custom rules
+
+Drop rule packs into `~/.ramster/rules.d/*.json` to teach ramster about your own tools, and share them
+with your team. Examples are in [contrib/rules.d](contrib/rules.d).
+
+```json
+{
+  "rules": [
+    {
+      "id": "elasticsearch",
+      "title": "Local Elasticsearch node",
+      "match": {"args": ["org.elasticsearch.bootstrap.Elasticsearch", "org.opensearch.bootstrap.OpenSearch"]},
+      "tier": "confirm",
+      "min_mb": 500,
+      "when": "idle",
+      "action": "term",
+      "tip": "Cap the heap for development: -Xms1g -Xmx1g in config/jvm.options.d/heap.options."
+    }
+  ]
+}
+```
+
+| field | meaning |
+|---|---|
+| `id` | rule name; findings get ids like `elasticsearch:1234`, so `ramster free elasticsearch` works |
+| `match` | `name` (executable), `args` (command line), `path` (executable path): case-insensitive substrings, a string or a list (any entry matches); `app`: exact app name. Every given field must match. With only `app`, the rule covers the whole app |
+| `tier` | `safe`, `confirm` (default) or `info` |
+| `min_mb` | ignore smaller matches (default 100) |
+| `when` | `idle` (default), `detached` (idle and its terminal or agent is gone) or `always` |
+| `action` | `term` (default, SIGTERM the process tree), `quit` (apps only), `none`, or `{"cmd": ["brew", "services", "stop", "postgresql@16"]}` |
+| `title`, `detail`, `tip` | text shown with the finding |
+
+Whatever a rule says, ramster never suggests a busy process, only signals your own processes, re-checks
+start times before signalling, and honours `never_touch`. `safe` rules can be freed by agents and by
+`auto_free_safe` without asking, so use it only for things that restart on demand. `ramster rules` lists
+what loaded and points at mistakes; the daemon picks up changes on its next check.
+
 ## How it measures
 
 - **Per process**: `proc_pid_rusage` → `ri_phys_footprint` (Activity Monitor's "Memory", includes compressed pages),
@@ -163,8 +204,8 @@ make test    # unit tests (rules, report, MCP protocol, real-kernel probe checks
 make lint    # rustfmt + clippy -D warnings
 ```
 
-Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules, actions,
-report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
+Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules in
+`rules.rs` and `devtools.rs`, rules.d in `custom.rs`, actions, report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
 `src/main.rs` (CLI), `src/bin/ramster-bar.rs` (menu bar app), `packaging/Info.plist`.
 
 The CLI and daemon don't link AppKit; only `ramster-bar` does. `RAMSTER_BAR_SELFTEST=n` opens and closes
