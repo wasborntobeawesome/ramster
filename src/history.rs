@@ -4,9 +4,11 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
-use crate::util::{local_date, now_unix};
+use crate::util::{local_date, now_unix, run};
 
 /// One daemon tick. Sizes in MB; CPU in permille of one core (1000 = one full core)
 /// averaged since the previous tick.
@@ -70,9 +72,39 @@ pub fn load(since: i64) -> Vec<Sample> {
     load_from(&dir(), since)
 }
 
+/// `YYYY-MM-DD` of a history file name (`.ndjson` or `.ndjson.gz`).
+fn day_of(name: &str) -> Option<&str> {
+    let date = name
+        .strip_suffix(".ndjson.gz")
+        .or_else(|| name.strip_suffix(".ndjson"))?;
+    (date.len() == 10).then_some(date)
+}
+
+/// The system gzip; we shell out rather than link a compression crate.
+fn gzip() -> &'static str {
+    if Path::new("/usr/bin/gzip").is_file() {
+        "/usr/bin/gzip"
+    } else {
+        "gzip"
+    }
+}
+
+/// Parse the samples newer than `since` from one day file into `out`.
+fn read_samples(r: impl BufRead, since: i64, out: &mut Vec<Sample>) {
+    for line in r.lines().map_while(Result::ok) {
+        if let Ok(s) = serde_json::from_str::<Sample>(&line) {
+            if s.t >= since {
+                out.push(s);
+            }
+        }
+    }
+}
+
 /// Reads only the day files that can contain samples after `since`. Cost is
-/// bounded by the files on disk, however far back `since` is.
-pub fn load_from(dir: &std::path::Path, since: i64) -> Vec<Sample> {
+/// bounded by the files on disk, however far back `since` is. Finished days may
+/// be gzipped (`.ndjson.gz`, streamed through `gzip -dc`); a day present in both
+/// forms is read from both and deduplicated by timestamp.
+pub fn load_from(dir: &Path, since: i64) -> Vec<Sample> {
     // One day of slack for time-zone/DST edges; names are YYYY-MM-DD so they sort.
     let first_day = local_date(since.saturating_sub(86_400).max(0));
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -82,22 +114,29 @@ pub fn load_from(dir: &std::path::Path, since: i64) -> Vec<Sample> {
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            let date = name.strip_suffix(".ndjson")?.to_string();
-            (date.len() == 10 && date >= first_day).then(|| e.path())
+            (day_of(&name)? >= first_day.as_str()).then(|| e.path())
         })
         .collect();
     files.sort();
     let mut out = Vec::new();
     for f in files {
-        let Ok(file) = std::fs::File::open(&f) else {
-            continue;
-        };
-        for line in BufReader::new(file).lines().map_while(Result::ok) {
-            if let Ok(s) = serde_json::from_str::<Sample>(&line) {
-                if s.t >= since {
-                    out.push(s);
-                }
+        if f.extension().is_some_and(|x| x == "gz") {
+            let Ok(mut child) = Command::new(gzip())
+                .arg("-dc")
+                .arg(&f)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            else {
+                continue;
+            };
+            if let Some(stdout) = child.stdout.take() {
+                read_samples(BufReader::new(stdout), since, &mut out);
             }
+            let _ = child.wait();
+        } else if let Ok(file) = std::fs::File::open(&f) {
+            read_samples(BufReader::new(file), since, &mut out);
         }
     }
     out.sort_by_key(|s| s.t);
@@ -105,18 +144,61 @@ pub fn load_from(dir: &std::path::Path, since: i64) -> Vec<Sample> {
     out
 }
 
-/// Delete day files older than the retention window.
+/// The daemon's periodic housekeeping: gzip finished days, then delete days
+/// older than the retention window.
 pub fn prune(retention_days: u32) {
-    let cutoff = local_date(now_unix() - retention_days as i64 * 86_400);
-    let Ok(entries) = std::fs::read_dir(dir()) else {
+    let now = now_unix();
+    compress_in(&dir(), now);
+    prune_in(&dir(), retention_days, now);
+}
+
+/// Gzip day files from before today that haven't been written to for 10
+/// minutes (about 3 MB a day shrinks ~10x). A day that already has a `.gz`
+/// (a late write after compression) is left alone; `load_from` reads both.
+pub fn compress_in(dir: &Path, now: i64) {
+    let today = local_date(now);
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for e in entries.flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if let Some(date) = name.strip_suffix(".ndjson") {
-            if date < cutoff.as_str() {
-                let _ = std::fs::remove_file(e.path());
-            }
+        let Some(date) = name.strip_suffix(".ndjson") else {
+            continue;
+        };
+        if date.len() != 10 || date >= today.as_str() {
+            continue;
+        }
+        let settled = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age > Duration::from_secs(600));
+        if !settled || dir.join(format!("{name}.gz")).exists() {
+            continue;
+        }
+        let path = e.path();
+        let (ok, out) = run(
+            Duration::from_secs(120),
+            gzip(),
+            &["-f", &path.to_string_lossy()],
+        );
+        if !ok {
+            eprintln!("gzip {}: {out}", path.display());
+        }
+    }
+}
+
+/// Delete day files (plain or gzipped) older than the retention window.
+pub fn prune_in(dir: &Path, retention_days: u32, now: i64) {
+    let cutoff = local_date(now - retention_days as i64 * 86_400);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if day_of(&name).is_some_and(|date| date < cutoff.as_str()) {
+            let _ = std::fs::remove_file(e.path());
         }
     }
 }
@@ -199,6 +281,116 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(all.len(), 3);
         assert_eq!(load_from(&dir, now - 120).len(), 2);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ramster-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Append samples at times `ts` to `dir/<name>` and backdate its mtime by `age`.
+    fn write_day(dir: &Path, name: &str, ts: &[i64], age: u64) -> PathBuf {
+        let path = dir.join(name);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        for &t in ts {
+            let s = Sample {
+                t,
+                ..Default::default()
+            };
+            writeln!(f, "{}", serde_json::to_string(&s).unwrap()).unwrap();
+        }
+        let mtime = std::time::SystemTime::now() - Duration::from_secs(age);
+        f.set_modified(mtime).unwrap();
+        path
+    }
+
+    fn times(samples: &[Sample]) -> Vec<i64> {
+        samples.iter().map(|s| s.t).collect()
+    }
+
+    #[test]
+    fn gz_day_file_loads() {
+        let dir = temp_dir("hist-gz");
+        let t = now_unix() - 2 * 86_400;
+        let path = write_day(&dir, &format!("{}.ndjson", local_date(t)), &[t, t + 60], 0);
+        assert!(
+            run(
+                Duration::from_secs(10),
+                gzip(),
+                &["-f", &path.to_string_lossy()]
+            )
+            .0
+        );
+        assert!(!path.exists());
+        assert_eq!(times(&load_from(&dir, t - 10)), vec![t, t + 60]);
+        assert_eq!(times(&load_from(&dir, t + 30)), vec![t + 60]);
+        // The date filter still skips gz days that can't contain newer samples.
+        assert!(load_from(&dir, now_unix()).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn compress_old_days_only() {
+        let dir = temp_dir("hist-compress");
+        let now = now_unix();
+        let (d3, d2, d1) = (now - 3 * 86_400, now - 2 * 86_400, now - 86_400);
+        let day = |t: i64| format!("{}.ndjson", local_date(t));
+        let old = write_day(&dir, &day(d3), &[d3], 3600);
+        // Finished day, but written to moments ago: wait for it to settle.
+        let fresh = write_day(&dir, &day(d1), &[d1], 0);
+        let today = write_day(&dir, &day(now), &[now], 3600);
+        // A day in both forms (late write after compression): left alone, read from both.
+        let both = write_day(&dir, &day(d2), &[d2, d2 + 60], 3600);
+        assert!(
+            run(
+                Duration::from_secs(10),
+                gzip(),
+                &["-f", &both.to_string_lossy()]
+            )
+            .0
+        );
+        write_day(&dir, &day(d2), &[d2 + 60, d2 + 120], 3600);
+
+        compress_in(&dir, now);
+
+        assert!(!old.exists());
+        assert!(dir.join(format!("{}.gz", day(d3))).exists());
+        assert!(fresh.exists() && today.exists() && both.exists());
+        assert!(!dir.join(format!("{}.gz", day(d1))).exists());
+        assert!(!dir.join(format!("{}.gz", day(now))).exists());
+        assert_eq!(
+            times(&load_from(&dir, d3 - 10)),
+            vec![d3, d2, d2 + 60, d2 + 120, d1, now]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_removes_old_plain_and_gz() {
+        let dir = temp_dir("hist-prune");
+        let now = now_unix();
+        let old = now - 10 * 86_400;
+        let recent = now - 86_400;
+        let a = write_day(&dir, &format!("{}.ndjson", local_date(old)), &[old], 0);
+        let b = write_day(
+            &dir,
+            &format!("{}.ndjson.gz", local_date(old - 86_400)),
+            &[],
+            0,
+        );
+        let c = write_day(&dir, &format!("{}.ndjson.gz", local_date(recent)), &[], 0);
+        let d = write_day(&dir, &format!("{}.ndjson", local_date(now)), &[now], 0);
+        std::fs::write(dir.join("notes.txt"), "kept").unwrap();
+        prune_in(&dir, 7, now);
+        assert!(!a.exists() && !b.exists());
+        assert!(c.exists() && d.exists() && dir.join("notes.txt").exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
