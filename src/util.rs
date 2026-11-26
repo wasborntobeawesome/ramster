@@ -1,5 +1,6 @@
 //! Small helpers: time, formatting, subprocesses. Kept dependency-free on purpose.
 
+use std::io::{BufRead, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -144,6 +145,15 @@ pub fn which(name: &str, fallbacks: &[&str]) -> Option<String> {
         .iter()
         .find(|p| std::path::Path::new(p).is_file())
         .map(|s| s.to_string())
+}
+
+/// Ask a yes/no question on the terminal; anything but y/yes is no.
+pub fn ask(q: &str) -> bool {
+    print!("{q} [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().lock().read_line(&mut line);
+    matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 #[cfg(test)]
