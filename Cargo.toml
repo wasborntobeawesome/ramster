@@ -8,6 +8,8 @@ repository = "https://github.com/wasborntobeawesome/ramster"
 readme = "README.md"
 keywords = ["memory", "macos", "mcp", "developer-tools", "ram"]
 categories = ["command-line-utilities", "development-tools"]
+# The crate is for `cargo install ramster`; app packaging, icons and CI stay in git.
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/PLAN.md", "/LICENSE*"]
 
 [dependencies]
 libc = "0.2"
