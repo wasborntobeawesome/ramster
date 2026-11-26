@@ -41,6 +41,7 @@ mod bar {
         NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSObject,
         NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer,
     };
+    use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
     use ramster::analyze::rules::{Finding, CONFIRM, INFO, SAFE};
     use ramster::analyze::{act, report};
@@ -105,6 +106,11 @@ mod bar {
             #[unsafe(method(toggleSampler:))]
             fn toggle_sampler(&self, _sender: &NSMenuItem) {
                 self.toggle_agent();
+            }
+
+            #[unsafe(method(toggleLoginItem:))]
+            fn toggle_login_item(&self, _sender: &NSMenuItem) {
+                self.toggle_login();
             }
 
             #[unsafe(method(openMenu:))]
@@ -273,6 +279,33 @@ mod bar {
             return Some(sibling);
         }
         ramster::util::which("ramster", &[]).map(PathBuf::from)
+    }
+
+    /// SMAppService.mainAppService only works from an app bundle
+    /// (`ramster.app/Contents/MacOS/ramster-bar`), not from target/release.
+    fn in_app_bundle() -> bool {
+        let Some(exe) = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.canonicalize().ok())
+        else {
+            return false;
+        };
+        let contents = exe.parent().and_then(|m| {
+            (m.file_name()? == "MacOS")
+                .then_some(m.parent()?)
+                .filter(|c| c.file_name().is_some_and(|n| n == "Contents"))
+        });
+        contents.is_some_and(|c| {
+            c.join("Info.plist").is_file()
+                && c.parent()
+                    .and_then(|a| a.extension())
+                    .is_some_and(|x| x == "app")
+        })
+    }
+
+    /// Launch-at-login status, or None when not running from an app bundle.
+    fn login_status() -> Option<SMAppServiceStatus> {
+        in_app_bundle().then(|| unsafe { SMAppService::mainAppService().status() })
     }
 
     impl Bar {
@@ -513,15 +546,33 @@ mod bar {
             sampler.setState(if daemon::agent_installed() { 1 } else { 0 });
             sampler.setToolTip(Some(&ns("Samples memory once a minute (~5 MB RAM) so ramster can spot what you leave open and idle.")));
             menu.addItem(&sampler);
+            let login = self.action_item("Launch at login", sel!(toggleLoginItem:), "");
+            let status = login_status();
+            match status {
+                None => {
+                    login.setEnabled(false);
+                    login.setToolTip(Some(&ns("Only available when ramster runs from ramster.app (make app), not from a bare binary.")));
+                }
+                Some(s) if s == SMAppServiceStatus::Enabled => login.setState(1),
+                Some(s) if s == SMAppServiceStatus::RequiresApproval => {
+                    login.setState(-1); // mixed
+                    login.setToolTip(Some(&ns(
+                        "Waiting for your approval in System Settings › General › Login Items.",
+                    )));
+                }
+                Some(_) => login.setState(0),
+            }
+            menu.addItem(&login);
             menu.addItem(&NSMenuItem::separatorItem(mtm));
             menu.addItem(&self.action_item("Quit ramster", sel!(quit:), "q"));
 
             if std::env::var_os("RAMSTER_BAR_DEBUG").is_some() {
                 eprintln!(
-                    "menu rebuilt in {} ms: {} groups, {} findings",
+                    "menu rebuilt in {} ms: {} groups, {} findings, launch at login: {}",
                     started.elapsed().as_millis(),
                     snap.groups.len(),
-                    fs.len()
+                    fs.len(),
+                    status.map_or("n/a (not bundled)".into(), |s| format!("{}", s.0))
                 );
             }
             st.findings = fs;
@@ -677,6 +728,44 @@ mod bar {
                 self.alert(
                     "Could not change the background sampler",
                     &out,
+                    &["OK"],
+                    true,
+                );
+            }
+        }
+
+        fn toggle_login(&self) {
+            if !in_app_bundle() {
+                self.alert(
+                    "Launch at login needs the app",
+                    "Build it with `make app` and run ramster.app; a bare binary can't be a login item.",
+                    &["OK"],
+                    true,
+                );
+                return;
+            }
+            let svc = unsafe { SMAppService::mainAppService() };
+            let status = unsafe { svc.status() };
+            if status == SMAppServiceStatus::RequiresApproval {
+                if self.alert(
+                    "Approve ramster in System Settings",
+                    "macOS needs your OK in System Settings › General › Login Items before ramster can start at login.",
+                    &["Open System Settings", "Later"],
+                    false,
+                ) {
+                    unsafe { SMAppService::openSystemSettingsLoginItems() };
+                }
+                return;
+            }
+            let res = if status == SMAppServiceStatus::Enabled {
+                unsafe { svc.unregisterAndReturnError() }
+            } else {
+                unsafe { svc.registerAndReturnError() }
+            };
+            if let Err(e) = res {
+                self.alert(
+                    "Could not change launch at login",
+                    &e.localizedDescription().to_string(),
                     &["OK"],
                     true,
                 );
