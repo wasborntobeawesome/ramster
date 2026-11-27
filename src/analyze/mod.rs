@@ -144,7 +144,7 @@ impl Snapshot {
                 g
             })
             .collect();
-        s.groups.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+        s.groups.sort_by_key(|g| std::cmp::Reverse(g.bytes));
         s
     }
 

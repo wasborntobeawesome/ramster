@@ -137,11 +137,7 @@ pub fn mem_from(meminfo: &str, psi: Option<&str>, zram_bytes: u64) -> Mem {
     let compressed = kb("Zswap") + zram_bytes;
     let wired = kb("SUnreclaim") + kb("KernelStack") + kb("PageTables");
     let cached = (kb("Buffers") + kb("Cached") + kb("SReclaimable")).saturating_sub(kb("Shmem"));
-    let free_percent = if total > 0 {
-        (available * 100 / total) as i32
-    } else {
-        0
-    };
+    let free_percent = (available * 100).checked_div(total).unwrap_or(0) as i32;
     let swap_total = kb("SwapTotal");
     Mem {
         total,
