@@ -210,9 +210,9 @@ fn lm_studio(c: &Ctx) -> Vec<Finding> {
         frees_mb: frees,
         action,
         tip: "LM Studio can unload models on its own: turn on the idle TTL (Developer → Server settings → Auto unload unused JIT loaded models).".into(),
+        starts: c.starts_of(&g.pids),
         pids: g.pids.clone(),
         act,
-        ..Default::default()
     }]
 }
 

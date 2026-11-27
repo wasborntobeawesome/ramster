@@ -3,15 +3,16 @@
 //! - Per process: PSS + SwapPss from `smaps_rollup` (your own processes; the
 //!   kernel refuses others without root), CPU and start time from `stat`.
 //! - Apps: the systemd scope or service a process runs in (what desktop
-//!   launchers create), so browser helpers group under their browser.
+//!   launchers create), so browser helpers group under their browser; what
+//!   runs from a shell keeps its own name (see `procfs::assign_apps`).
 //! - Orphans: processes re-parented to the user's service manager (a subreaper)
 //!   are reported with ppid 1, like processes re-parented to launchd on macOS.
 //! - System: /proc/meminfo, PSI (/proc/pressure/memory), zswap and zram.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-use super::procfs::{self, Stat, PF_KTHREAD};
+use super::procfs::{self, Placement, Stat, PF_KTHREAD};
 use super::{clip, Mem, Proc};
 
 fn read(path: &str) -> Option<String> {
@@ -57,37 +58,18 @@ fn cmdline(pid: i32) -> String {
     clip(String::from_utf8_lossy(&s).trim_end())
 }
 
-/// The desktop app of a process, if it was started from a launcher.
-fn app_of(pid: i32, name: &str) -> String {
-    let Some(cg) = read(&format!("/proc/{pid}/cgroup")) else {
-        return String::new();
-    };
-    let Some(app) = procfs::unit_of_cgroup(&cg).and_then(procfs::app_of_unit) else {
-        return String::new();
-    };
-    // Shells and tools started inside a terminal share its scope (Konsole,
-    // kitty...); they keep their own names, only the terminal itself is the app.
-    if procfs::is_terminal_app(&app) {
-        let short = app.rsplit('.').next().unwrap_or(&app).to_lowercase();
-        let n = name.to_lowercase();
-        if !(n.contains(&short) || short.contains(&n) || n.contains("terminal")) {
-            return String::new();
-        }
-    }
-    app
-}
-
 pub fn procs() -> Result<Vec<Proc>, String> {
     let dir = std::fs::read_dir("/proc").map_err(|e| format!("/proc: {e}"))?;
     let me = unsafe { libc::getuid() };
     let tck = clk_tck();
     let mut out = Vec::new();
+    let mut place: HashMap<i32, Placement> = HashMap::new();
     for e in dir.flatten() {
         let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
         let Some(st) = stat(pid) else { continue }; // exited meanwhile
-        if st.flags & PF_KTHREAD != 0 {
+        if st.flags & PF_KTHREAD != 0 || st.exited() {
             continue;
         }
         let uid = read(&format!("/proc/{pid}/status"))
@@ -110,30 +92,18 @@ pub fn procs() -> Result<Vec<Proc>, String> {
             }
             p.path = link(&format!("/proc/{pid}/exe"));
             p.args = cmdline(pid);
-            p.app = app_of(pid, &p.name);
+            if let Some(cg) = read(&format!("/proc/{pid}/cgroup")) {
+                place.insert(pid, procfs::placement(&cg));
+            }
         }
         out.push(p);
     }
     if out.is_empty() {
         return Err("no processes readable in /proc".into());
     }
-    reparent_to_init(&mut out);
+    procfs::assign_apps(&mut out, &place);
+    procfs::reparent_to_init(&mut out, &place);
     Ok(out)
-}
-
-/// Children of a user service manager (`systemd --user`, a subreaper that
-/// adopts orphans) count as re-parented to init, as on macOS.
-fn reparent_to_init(ps: &mut [Proc]) {
-    let managers: HashSet<i32> = ps
-        .iter()
-        .filter(|p| p.pid != 1 && p.name == "systemd")
-        .map(|p| p.pid)
-        .collect();
-    for p in ps.iter_mut() {
-        if managers.contains(&p.ppid) {
-            p.ppid = 1;
-        }
-    }
 }
 
 pub fn memory() -> Result<Mem, String> {
@@ -155,9 +125,13 @@ pub fn cwd(pid: i32) -> String {
     link(&format!("/proc/{pid}/cwd"))
 }
 
-/// Unix start time, or -1 if the process is gone.
+/// Unix start time, or -1 if the process is gone (zombies included: they
+/// have exited and only wait for their parent to collect them).
 pub fn start_time(pid: i32) -> i64 {
-    stat(pid).map(|s| start_of(&s)).unwrap_or(-1)
+    match stat(pid) {
+        Some(s) if !s.exited() => start_of(&s),
+        _ => -1,
+    }
 }
 
 pub fn parent_of(pid: i32) -> i32 {
@@ -227,5 +201,23 @@ mod tests {
             "{m:?}"
         );
         assert!(!cwd(me.pid).is_empty());
+    }
+
+    #[test]
+    fn zombies_count_as_gone() {
+        // A child that exited but that we haven't reaped yet.
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as i32;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while stat(pid).is_some_and(|s| !s.exited()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            stat(pid).is_some_and(|s| s.exited()),
+            "still a zombie in /proc"
+        );
+        assert_eq!(start_time(pid), -1);
+        assert!(procs().unwrap().iter().all(|p| p.pid != pid));
+        child.wait().unwrap();
     }
 }

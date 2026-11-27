@@ -257,18 +257,26 @@ pub fn cmd_agent(sub: &str, exe: Option<std::path::PathBuf>) -> Result<(), Strin
             );
         }
         "status" => {
-            let Some(pid) = service::running_pid() else {
-                println!("Not running. Install with: ramster agent install");
-                return Ok(());
+            let pid = match (service::installed(), service::running_pid()) {
+                (_, Some(pid)) if pid > 0 => pid,
+                (true, _) => {
+                    println!(
+                        "Installed, but not running right now. Check: {}",
+                        service::HINT
+                    );
+                    return Ok(());
+                }
+                (false, _) => {
+                    println!("Not installed. Install with: ramster agent install");
+                    return Ok(());
+                }
             };
             println!("Running (pid {pid}).");
-            if pid > 0 {
-                if let Some(p) = probe::procs()?.into_iter().find(|p| p.pid == pid) {
-                    println!(
-                        "  daemon memory: {:.1} MB",
-                        p.footprint as f64 / (1u64 << 20) as f64
-                    );
-                }
+            if let Some(p) = probe::procs()?.into_iter().find(|p| p.pid == pid) {
+                println!(
+                    "  daemon memory: {:.1} MB",
+                    p.footprint as f64 / (1u64 << 20) as f64
+                );
             }
             println!(
                 "  samples in the last 24h: {}",
@@ -338,6 +346,9 @@ mod service {
             .replace('>', "&gt;")
     }
 
+    pub const HINT: &str =
+        "launchctl print gui/$(id -u)/dev.ramster.daemon, and ~/.ramster/daemon.log";
+
     pub fn installed() -> bool {
         std::path::Path::new(&plist_path()).exists()
     }
@@ -397,13 +408,15 @@ mod service {
 /// A systemd user unit: runs at login, restarts if it dies, low priority.
 #[cfg(any(target_os = "linux", test))]
 pub fn systemd_unit(exe: &str, log: &str) -> String {
-    // systemd unit syntax: quote paths, double `%` (specifier) and escape `\` and `"`.
+    // systemd unit syntax: quote the command path, escape `\` and `"`, double
+    // `%` (specifiers) and `$` (ExecStart expands $VAR).
     let q = |s: &str| {
         format!(
             "\"{}\"",
             s.replace('\\', "\\\\")
                 .replace('"', "\\\"")
                 .replace('%', "%%")
+                .replace('$', "$$")
         )
     };
     let raw = |s: &str| s.replace('%', "%%");
@@ -455,6 +468,8 @@ mod service {
         }
     }
 
+    pub const HINT: &str = "systemctl --user status ramster, and ~/.ramster/daemon.log";
+
     pub fn installed() -> bool {
         unit_path().exists()
     }
@@ -465,9 +480,18 @@ mod service {
             std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
         std::fs::write(&path, super::systemd_unit(exe, log)).map_err(|e| e.to_string())?;
-        systemctl(&["daemon-reload"])?;
-        systemctl(&["enable", UNIT])?;
-        systemctl(&["restart", UNIT]).map(|_| ())
+        let started = systemctl(&["daemon-reload"])
+            .and_then(|_| systemctl(&["enable", UNIT]))
+            .and_then(|_| systemctl(&["restart", UNIT]));
+        if let Err(e) = started {
+            // Don't leave a unit behind that makes us look installed.
+            let _ = std::fs::remove_file(&path);
+            let _ = systemctl(&["daemon-reload"]);
+            return Err(format!(
+                "{e}\n(is there a systemd user session? `systemctl --user status` should work)"
+            ));
+        }
+        Ok(())
     }
 
     pub fn uninstall() -> Result<(), String> {
@@ -488,6 +512,7 @@ mod service {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod service {
     const NO: &str = "the background sampler needs launchd (macOS) or systemd (Linux)";
+    pub const HINT: &str = NO;
     pub fn installed() -> bool {
         false
     }
@@ -516,5 +541,7 @@ mod tests {
         assert!(u.contains("StandardOutput=append:/home/me/.ramster/daemon.log\n"));
         assert!(u.contains("WantedBy=default.target"));
         assert!(systemd_unit("/x/100%/ramster", "/l").contains("ExecStart=\"/x/100%%/ramster\""));
+        assert!(systemd_unit("/home/me/$tools/ramster", "/l")
+            .contains("ExecStart=\"/home/me/$$tools/ramster\" daemon"));
     }
 }

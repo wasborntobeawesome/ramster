@@ -567,3 +567,63 @@ fn commented_gradle_property_does_not_count() {
         key
     ));
 }
+
+#[test]
+fn unverifiable_pids_are_never_signalled() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    // No start time recorded: we can't prove it's the process we scanned.
+    let f = Finding {
+        id: "t".into(),
+        safety: SAFE,
+        pids: vec![pid],
+        act: Action::Term,
+        ..Default::default()
+    };
+    let r = act::execute(&f, false);
+    assert!(!r.ok && r.message.contains("changed"), "{r:?}");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "signalled an unverified PID"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[test]
+fn quit_findings_record_identity() {
+    let mut app = p(30, 1, "Slack", "", 900);
+    app.path = "/Applications/Slack.app/Contents/MacOS/Slack".into();
+    let mut helper = p(31, 30, "Slack Helper", "", 300);
+    helper.path =
+        "/Applications/Slack.app/Contents/Frameworks/Slack Helper.app/Contents/MacOS/Slack Helper"
+            .into();
+    let mut s = snap(vec![app, helper], &[]);
+    let now = now_unix();
+    s.attach_history(
+        &(0..=30)
+            .rev()
+            .map(|i| Sample {
+                t: now - i * 60,
+                g: vec![HGroup {
+                    n: "Slack".into(),
+                    m: 1200,
+                    c: 0,
+                    k: 2,
+                }],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>(),
+        20 * 60,
+    );
+    let fs = run_rules(&s, &Config::default());
+    let f = fs
+        .iter()
+        .find(|f| f.rule == "idle-app")
+        .expect("idle Slack");
+    assert_eq!(f.starts.len(), 2, "{:?}", f.starts);
+    assert!(f.pids.iter().all(|p| f.starts.contains_key(p)));
+}

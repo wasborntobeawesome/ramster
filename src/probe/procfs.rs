@@ -3,12 +3,14 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::Mem;
+use super::{Mem, Proc};
 
 /// The fields of /proc/<pid>/stat that ramster uses.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Stat {
     pub comm: String,
+    /// R, S, D, Z (zombie: exited, not yet reaped), X (dead), ...
+    pub state: char,
     pub ppid: i32,
     pub flags: u64,
     /// Clock ticks.
@@ -16,6 +18,13 @@ pub struct Stat {
     pub stime: u64,
     /// Clock ticks since boot.
     pub starttime: u64,
+}
+
+impl Stat {
+    /// Exited: a zombie waiting for its parent, or dead. Not running any more.
+    pub fn exited(&self) -> bool {
+        matches!(self.state, 'Z' | 'X' | 'x')
+    }
 }
 
 /// Kernel threads have no memory or command line of their own.
@@ -31,6 +40,7 @@ pub fn parse_stat(s: &str) -> Option<Stat> {
     let num = |n: usize| f.get(n - 3)?.parse::<u64>().ok();
     Some(Stat {
         comm,
+        state: f.first()?.chars().next()?,
         ppid: f.get(1)?.parse().ok()?,
         flags: num(9)?,
         utime: num(14)?,
@@ -171,18 +181,42 @@ pub fn parse_btime(s: &str) -> Option<i64> {
         .ok()
 }
 
-/// The systemd unit a process runs in, from the cgroup v2 line of
-/// /proc/<pid>/cgroup ("0::/user.slice/.../app-firefox-1234.scope").
+/// The cgroup path of a process from /proc/<pid>/cgroup: the unified (v2)
+/// hierarchy, or systemd's named hierarchy on cgroup-v1 systems.
+pub fn cgroup_path(s: &str) -> Option<&str> {
+    let v2 = s.lines().find_map(|l| l.strip_prefix("0::"));
+    let v1 = s
+        .lines()
+        .find_map(|l| l.split_once(":name=systemd:").map(|(_, p)| p));
+    [v2, v1]
+        .into_iter()
+        .flatten()
+        .find(|p| unit_of_path(p).is_some())
+        .or(v2)
+        .or(v1)
+}
+
+/// The nearest systemd unit on a cgroup path ("/user.slice/.../app-x.scope/sub"
+/// → "app-x.scope"): services may create sub-cgroups below their unit.
+pub fn unit_of_path(path: &str) -> Option<&str> {
+    path.rsplit('/')
+        .find(|c| c.ends_with(".scope") || c.ends_with(".service"))
+}
+
+/// The systemd unit a process runs in, from /proc/<pid>/cgroup.
 pub fn unit_of_cgroup(s: &str) -> Option<&str> {
-    let path = s.lines().find_map(|l| l.strip_prefix("0::"))?;
-    let leaf = path.rsplit('/').next()?;
-    (leaf.ends_with(".scope") || leaf.ends_with(".service")).then_some(leaf)
+    unit_of_path(cgroup_path(s)?)
 }
 
 /// Started on purpose by a service manager (systemd services, D-Bus activation),
 /// not by a person from a terminal or launcher.
 pub fn is_managed_unit(unit: &str) -> bool {
-    unit.ends_with(".service") && !unit.starts_with("app-") && !unit.starts_with("user@")
+    let u = unescape(unit);
+    // D-Bus activation: `dbus-:1.2-org.x@0.service` or `app-dbus-:1.2-org.x.scope`.
+    if u.starts_with("dbus-") || u.starts_with("app-dbus-") {
+        return true;
+    }
+    u.ends_with(".service") && !u.starts_with("app-") && !u.starts_with("user@")
 }
 
 /// systemd escapes '-' inside names as `\x2d`.
@@ -202,7 +236,9 @@ pub fn app_of_unit(unit: &str) -> Option<String> {
     if let Some(rest) = base.strip_prefix("snap.") {
         return Some(display_name(rest.split('.').next()?));
     }
-    let mut id = unescape(base.strip_prefix("app-")?);
+    // Work on the escaped name: a raw '-' separates launcher, id and instance,
+    // while dashes inside the id are escaped (`google\x2dchrome`).
+    let mut id = base.strip_prefix("app-")?.to_string();
     // app-<launcher>-<id>-<instance>: drop the instance, then the launcher.
     if let Some(i) = id.find('@') {
         id.truncate(i);
@@ -229,6 +265,7 @@ pub fn app_of_unit(unit: &str) -> Option<String> {
             }
         }
     }
+    let id = unescape(&id);
     if id.starts_with("dbus-") || id.is_empty() {
         return None;
     }
@@ -288,30 +325,110 @@ pub fn display_name(id: &str) -> String {
     id.to_string()
 }
 
-/// Terminal emulators: what runs inside them keeps its own name.
-pub fn is_terminal_app(app: &str) -> bool {
-    const T: &[&str] = &[
-        "konsole",
-        "Terminal",
-        "gnome-terminal",
-        "kitty",
-        "alacritty",
-        "Alacritty",
-        "wezterm",
-        "org.wezfurlong.wezterm",
-        "foot",
-        "tilix",
-        "ptyxis",
-        "Ptyxis",
-        "ghostty",
-        "com.mitchellh.ghostty",
-        "xterm",
-        "terminator",
-        "warp",
-        "rio",
-        "tabby",
-    ];
-    T.iter().any(|t| t.eq_ignore_ascii_case(app))
+/// Where a process runs, from /proc/<pid>/cgroup.
+#[derive(Clone, Debug, Default)]
+pub struct Placement {
+    /// Full cgroup path (processes of one scope share it).
+    pub path: String,
+    /// The systemd unit, if any.
+    pub unit: Option<String>,
+    /// The desktop app that unit belongs to, if any.
+    pub app: Option<String>,
+}
+
+pub fn placement(cgroup: &str) -> Placement {
+    let path = cgroup_path(cgroup).unwrap_or_default();
+    let unit = unit_of_path(path);
+    Placement {
+        path: path.to_string(),
+        unit: unit.map(String::from),
+        app: unit.and_then(app_of_unit),
+    }
+}
+
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ksh", "mksh", "tcsh", "csh", "nu", "xonsh", "elvish",
+    "pwsh",
+];
+
+fn is_shell(p: &Proc) -> bool {
+    let exe = p.path.rsplit('/').next().unwrap_or("");
+    SHELLS.contains(&p.name.as_str()) || SHELLS.contains(&exe)
+}
+
+/// Set `Proc::app` for the processes that are really part of a desktop app.
+///
+/// Every process inherits its parent's cgroup, so the scope alone would put
+/// everything started from an IDE's or terminal's shell into that app, and
+/// keep claiming processes that outlived it. Instead, per scope, the app is the
+/// earliest process whose parent is outside the scope (what the launcher
+/// started) and its descendants, stopping at shells: what you run from a shell
+/// keeps its own name, and processes adopted by `systemd --user` after their
+/// parent exited (also parented outside the scope) belong to no app.
+pub fn assign_apps(ps: &mut [Proc], place: &HashMap<i32, Placement>) {
+    let idx: HashMap<i32, usize> = ps.iter().enumerate().map(|(i, p)| (p.pid, i)).collect();
+    let path_of = |pid: i32| place.get(&pid).map(|pl| pl.path.as_str());
+    // Per scope: the launcher-started main process.
+    let mut main: HashMap<&str, (i64, i32)> = HashMap::new();
+    for p in ps.iter() {
+        let Some(pl) = place.get(&p.pid).filter(|pl| pl.app.is_some()) else {
+            continue;
+        };
+        if path_of(p.ppid) == Some(pl.path.as_str()) {
+            continue; // started inside the scope
+        }
+        let e = main.entry(pl.path.as_str()).or_insert((p.start, p.pid));
+        if (p.start, p.pid) < *e {
+            *e = (p.start, p.pid);
+        }
+    }
+    let apps: Vec<(usize, String)> = ps
+        .iter()
+        .enumerate()
+        .filter_map(|(i, p)| {
+            let pl = place.get(&p.pid)?;
+            let app = pl.app.as_ref()?;
+            let &(_, root) = main.get(pl.path.as_str())?;
+            let mut cur = p;
+            for _ in 0..64 {
+                if is_shell(cur) {
+                    return None;
+                }
+                if cur.pid == root {
+                    return Some((i, app.clone()));
+                }
+                if path_of(cur.ppid) != Some(pl.path.as_str()) {
+                    return None; // entered the scope some other way (adopted)
+                }
+                cur = &ps[*idx.get(&cur.ppid)?];
+            }
+            None
+        })
+        .collect();
+    for p in ps.iter_mut() {
+        p.app.clear();
+    }
+    for (i, app) in apps {
+        ps[i].app = app;
+    }
+}
+
+/// Children of a user service manager (`systemd --user`, a subreaper that
+/// adopts orphans) count as re-parented to init, as on macOS, but only when
+/// we know their unit: without it we can't tell a managed service from an
+/// orphan, so they are not offered as orphans.
+pub fn reparent_to_init(ps: &mut [Proc], place: &HashMap<i32, Placement>) {
+    let managers: HashSet<i32> = ps
+        .iter()
+        .filter(|p| p.pid != 1 && p.name == "systemd")
+        .map(|p| p.pid)
+        .collect();
+    for p in ps.iter_mut() {
+        let known = place.get(&p.pid).is_some_and(|pl| pl.unit.is_some());
+        if managers.contains(&p.ppid) && known {
+            p.ppid = 1;
+        }
+    }
 }
 
 /// Socket inodes in LISTEN state from /proc/net/tcp or /proc/net/tcp6.
@@ -340,6 +457,9 @@ mod tests {
 
     #[test]
     fn stat_with_odd_comm() {
+        let z = parse_stat("77 (defunct) Z 1 77 77 0 -1 4194572 0 0 0 0 0 0 0 0 20 0 1 0 5000 0 0")
+            .unwrap();
+        assert!(z.exited());
         let s = "4242 (Web Content (x)) S 4100 4242 4242 0 -1 4194560 5000 0 12 0 731 202 0 0 20 0 30 0 987654 3000000000 50000 18446744073709551615";
         let st = parse_stat(s).unwrap();
         assert_eq!(st.comm, "Web Content (x)");
@@ -442,6 +562,18 @@ Zswapped:        1500000 kB
             Some("Slack")
         );
         assert_eq!(app("vte-spawn-0b1c2d.scope"), None);
+        // A launcher-like prefix that is part of the id itself survives.
+        assert_eq!(
+            app("app-gnome\\x2dsystem\\x2dmonitor@abc.service").as_deref(),
+            Some("gnome-system-monitor")
+        );
+        assert_eq!(
+            app("app-kde-kde\\x2dconnect-1a2b.scope").as_deref(),
+            Some("kde-connect")
+        );
+        assert!(is_managed_unit(
+            "app-dbus\\x2d:1.2\\x2dorg.freedesktop.portal.Desktop.scope"
+        ));
         assert_eq!(app("session-3.scope"), None);
         assert_eq!(app("pipewire.service"), None);
         assert_eq!(
@@ -454,7 +586,78 @@ Zswapped:        1500000 kB
         ));
         assert!(!is_managed_unit("app-org.kde.konsole@3f2a9b.service"));
         assert!(!is_managed_unit("app-gnome-firefox-12345.scope"));
-        assert!(is_terminal_app("konsole") && !is_terminal_app("Firefox"));
+    }
+
+    fn proc(pid: i32, ppid: i32, name: &str, start: i64) -> Proc {
+        Proc {
+            pid,
+            ppid,
+            name: name.into(),
+            start,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apps_stop_at_shells_and_adoption() {
+        let code =
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-gnome-code-4242.scope";
+        let at = |path: &str, app: Option<&str>| Placement {
+            path: path.into(),
+            unit: path.rsplit('/').next().map(String::from),
+            app: app.map(String::from),
+        };
+        let mut ps = vec![
+            proc(900, 1, "systemd", 10),          // systemd --user
+            proc(800, 900, "gnome-shell", 20),    // the launcher
+            proc(100, 800, "code", 100),          // VS Code, started by the launcher
+            proc(101, 100, "code", 101),          // its helpers
+            proc(102, 101, "node", 102),          // extension host
+            proc(103, 102, "rust-analyzer", 103), // language server an extension started
+            proc(110, 100, "bash", 110),          // integrated terminal
+            proc(111, 110, "claude", 111),        // an agent run from it
+            proc(112, 111, "node", 112),          // its MCP server
+            proc(120, 900, "node", 120),          // an MCP server adopted after its agent exited
+        ];
+        let mut place: HashMap<i32, Placement> = HashMap::new();
+        for p in &ps {
+            let pl = match p.pid {
+                900 => at("/user.slice/user-1000.slice/user@1000.service/init.scope", None),
+                800 => at("/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@wayland.service", None),
+                _ => at(code, Some("Visual Studio Code")),
+            };
+            place.insert(p.pid, pl);
+        }
+        assign_apps(&mut ps, &place);
+        let app = |pid: i32| ps.iter().find(|p| p.pid == pid).unwrap().app.clone();
+        for pid in [100, 101, 102, 103] {
+            assert_eq!(app(pid), "Visual Studio Code", "pid {pid}");
+        }
+        for pid in [110, 111, 112, 120, 800, 900] {
+            assert_eq!(app(pid), "", "pid {pid} must not belong to VS Code");
+        }
+        reparent_to_init(&mut ps, &place);
+        assert_eq!(
+            ps.iter().find(|p| p.pid == 120).unwrap().ppid,
+            1,
+            "adopted orphan"
+        );
+        // Without a known unit, don't guess: not reparented, so never an orphan candidate.
+        let mut ps2 = vec![proc(900, 1, "systemd", 10), proc(130, 900, "python3", 130)];
+        reparent_to_init(&mut ps2, &HashMap::new());
+        assert_eq!(ps2[1].ppid, 900);
+    }
+
+    #[test]
+    fn cgroup_paths_v1_and_nested() {
+        // A service that created a sub-cgroup (podman, Delegate=yes).
+        let v2 = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/podman-pause.service/container\n";
+        assert_eq!(unit_of_cgroup(v2), Some("podman-pause.service"));
+        // cgroup v1: systemd's named hierarchy.
+        let v1 = "12:pids:/user.slice\n1:name=systemd:/user.slice/user-1000.slice/user@1000.service/app.slice/tray.service\n0::/\n";
+        assert_eq!(unit_of_cgroup(v1), Some("tray.service"));
+        assert!(is_managed_unit(unit_of_cgroup(v1).unwrap()));
+        assert_eq!(unit_of_cgroup("0::/\n"), None);
     }
 
     #[test]
