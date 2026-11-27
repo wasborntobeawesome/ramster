@@ -22,7 +22,7 @@ Usage:
   ramster report [--hours N]  your usage behaviour over time (needs the daemon)
   ramster rules               custom rules from ~/.ramster/rules.d and any errors in them
   ramster daemon              run the sampler in the foreground
-  ramster agent install       run the sampler in the background at login (launchd)
+  ramster agent install       run the sampler in the background at login (launchd / systemd)
   ramster agent uninstall|status
   ramster mcp                 MCP server on stdio, so AI agents can check and free memory
   ramster setup               register the MCP server and a memory_check line with your AI agents

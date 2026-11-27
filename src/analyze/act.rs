@@ -35,6 +35,18 @@ pub fn execute(f: &Finding, force: bool) -> Outcome {
             }
             r.message = format!("ran: {}", cmd.join(" "));
         }
+        #[cfg(not(target_os = "macos"))]
+        Action::Quit(app) => {
+            // No AppleScript: ask the app's top-level processes to exit, as closing
+            // its windows would. Helpers follow their parent.
+            let set: std::collections::HashSet<i32> = f.pids.iter().copied().collect();
+            let mut top = f.clone();
+            top.pids.retain(|&p| !set.contains(&probe::parent_of(p)));
+            let mut o = terminate(&top, force);
+            o.message = format!("{app}: {}", o.message);
+            return o;
+        }
+        #[cfg(target_os = "macos")]
         Action::Quit(app) => {
             let script = format!("tell application {} to quit", applescript_str(app));
             let (ok, out) = run(Duration::from_secs(30), "osascript", &["-e", &script]);
@@ -51,6 +63,7 @@ pub fn execute(f: &Finding, force: bool) -> Outcome {
     r
 }
 
+#[cfg(target_os = "macos")]
 fn applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -60,31 +73,35 @@ fn terminate(f: &Finding, force: bool) -> Outcome {
         id: f.id.clone(),
         ..Default::default()
     };
-    let targets: Vec<i32> = f
-        .pids
-        .iter()
-        .copied()
-        .filter(|&pid| {
-            let got = probe::start_time(pid);
-            if got < 0 {
-                return false; // already gone
-            }
-            match f.starts.get(&pid) {
-                Some(&want) if want > 0 && got > 0 => got == want, // else: PID recycled
-                _ => true,
-            }
-        })
-        .collect();
+    // Only signal a PID whose start time matches the one recorded when the
+    // finding was made; anything else may be a recycled PID.
+    let (mut targets, mut changed) = (Vec::new(), 0);
+    for &pid in &f.pids {
+        let got = probe::start_time(pid);
+        if got < 0 {
+            continue; // already gone
+        }
+        match f.starts.get(&pid) {
+            Some(&want) if want > 0 && got == want => targets.push(pid),
+            _ => changed += 1, // recycled, or no identity recorded: never guess
+        }
+    }
     if targets.is_empty() {
-        r.ok = true;
-        r.message = "already gone".into();
+        r.ok = changed == 0;
+        r.message = if changed == 0 {
+            "already gone".into()
+        } else {
+            format!("{changed} process(es) changed since the scan; run it again")
+        };
         return r;
     }
     for &pid in &targets {
         unsafe { libc::kill(pid, libc::SIGTERM) };
     }
     let mut alive = wait_gone(&targets, Duration::from_secs(8));
+    let mut killed = 0;
     if !alive.is_empty() && force {
+        killed = alive.len();
         for &pid in &alive {
             unsafe { libc::kill(pid, libc::SIGKILL) };
         }
@@ -102,6 +119,9 @@ fn terminate(f: &Finding, force: bool) -> Outcome {
     r.ok = true;
     r.estimated_freed_mb = f.frees_mb;
     r.message = format!("stopped {} process(es)", targets.len());
+    if killed > 0 {
+        r.message += &format!(" ({killed} needed SIGKILL)");
+    }
     r
 }
 

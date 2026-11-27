@@ -190,6 +190,13 @@ pub fn suggest_with(s: &Snapshot, cfg: &Config, facts: &Facts) -> Vec<Finding> {
 }
 
 impl Ctx<'_> {
+    /// Start times that identify these PIDs when the finding is carried out.
+    pub fn starts_of(&self, pids: &[i32]) -> HashMap<i32, i64> {
+        pids.iter()
+            .filter_map(|&p| self.s.proc(p).map(|q| (p, q.start)))
+            .collect()
+    }
+
     pub fn age(&self, p: &Proc) -> String {
         if p.start <= 0 {
             "?".into()
@@ -209,10 +216,7 @@ impl Ctx<'_> {
         detail: String,
         action: &str,
     ) -> Finding {
-        let starts = pids
-            .iter()
-            .filter_map(|&p| self.s.proc(p).map(|q| (p, q.start)))
-            .collect();
+        let starts = self.starts_of(&pids);
         Finding {
             id: format!("{rule}:{}", root.pid),
             rule: rule.into(),
@@ -585,6 +589,7 @@ fn detached_user_proc(p: &Proc, me: u32, now: i64) -> bool {
         && p.uid == me
         && p.readable
         && !p.path.contains(".app/Contents/")
+        && p.app.is_empty() // a desktop app (Linux), not a forgotten tool
         && !is_system_path(&p.path)
         // Build daemons, emulators and nx/turbo have their own rules. Dev servers,
         // test runners and LLM servers do too, but only above their thresholds,
@@ -836,6 +841,7 @@ fn idle_apps(c: &Ctx) -> Vec<Finding> {
                 action: "quit it normally (it may ask to save)".into(),
                 pids: g.pids.clone(),
                 act: Action::Quit(g.name.clone()),
+                starts: c.starts_of(&g.pids),
                 ..Default::default()
             })
         })

@@ -1,4 +1,5 @@
-//! Background sampler and its launchd integration.
+//! Background sampler and how it runs at login (launchd on macOS, a systemd
+//! user service on Linux).
 //!
 //! Built to stay tiny: one thread, no subprocesses on the hot path, and a slim
 //! copy of the previous sample (no command lines) kept between ticks.
@@ -12,6 +13,7 @@ use crate::history::{self, Group, ProcRec, Sample, Sys};
 use crate::probe::{self, Proc};
 use crate::util::{fmt_mb, now_unix, run, uid};
 
+#[cfg(target_os = "macos")]
 const LABEL: &str = "dev.ramster.daemon";
 
 fn logf(msg: &str) {
@@ -114,6 +116,7 @@ pub fn to_sample(s: &Snapshot) -> Sample {
                 && p.ppid == 1
                 && p.footprint >= 20 << 20
                 && !p.path.contains(".app/Contents/")
+                && p.app.is_empty()
                 && !is_system_path(&p.path));
         if let (true, Some(c)) = (keep, s.cpu.get(&p.pid)) {
             smp.p.push(ProcRec {
@@ -180,10 +183,14 @@ fn react(cfg: &Config, snap: &mut Snapshot, last_notify: &mut i64, last_auto: &m
     );
 }
 
+// ---- notifications ------------------------------------------------------------
+
+#[cfg(target_os = "macos")]
 fn applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+#[cfg(target_os = "macos")]
 fn notify(title: &str, body: &str) {
     let script = format!(
         "display notification {} with title {}",
@@ -193,60 +200,29 @@ fn notify(title: &str, body: &str) {
     let _ = run(Duration::from_secs(10), "osascript", &["-e", &script]);
 }
 
-// ---- launchd ----------------------------------------------------------------
-
-/// `bootout` returns before the old job is torn down; wait until launchd
-/// forgets the service so an immediate `bootstrap` doesn't fail with EIO.
-fn bootout_and_wait(service: &str) {
-    if !run(Duration::from_secs(5), "launchctl", &["print", service]).0 {
-        return; // not loaded
-    }
-    let _ = run(Duration::from_secs(10), "launchctl", &["bootout", service]);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline
-        && run(Duration::from_secs(5), "launchctl", &["print", service]).0
-    {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn bootstrap_with_retry(domain: &str, plist: &str) -> Result<(), String> {
-    let mut last = String::new();
-    for attempt in 0..5 {
-        let (ok, out) = run(
+/// Desktop notification through the freedesktop `notify-send`, when installed.
+#[cfg(not(target_os = "macos"))]
+fn notify(title: &str, body: &str) {
+    if let Some(bin) = crate::util::which("notify-send", &[]) {
+        let title = format!("ramster: {title}");
+        let _ = run(
             Duration::from_secs(10),
-            "launchctl",
-            &["bootstrap", domain, plist],
+            &bin,
+            &["--app-name=ramster", &title, body],
         );
-        if ok {
-            return Ok(());
-        }
-        last = out;
-        std::thread::sleep(Duration::from_millis(300 * (attempt + 1)));
     }
-    Err(format!("launchctl bootstrap: {last}"))
 }
 
-fn plist_path() -> String {
-    format!("{}/Library/LaunchAgents/{LABEL}.plist", crate::util::home())
-}
+// ---- running at login: launchd (macOS) or a systemd user service (Linux) ------
 
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-/// Is the launchd sampler installed?
+/// Is the background sampler installed?
 pub fn agent_installed() -> bool {
-    std::path::Path::new(&plist_path()).exists()
+    service::installed()
 }
 
 /// install | uninstall | status. `exe` is the ramster CLI binary to run as the
 /// daemon (defaults to the current executable).
 pub fn cmd_agent(sub: &str, exe: Option<std::path::PathBuf>) -> Result<(), String> {
-    let domain = format!("gui/{}", uid());
-    let service = format!("{domain}/{LABEL}");
     match sub {
         "install" => {
             let exe = match exe {
@@ -263,8 +239,123 @@ pub fn cmd_agent(sub: &str, exe: Option<std::path::PathBuf>) -> Result<(), Strin
                 .join("daemon.log")
                 .to_string_lossy()
                 .into_owned();
-            let plist = format!(
-                r#"<?xml version="1.0" encoding="UTF-8"?>
+            service::install(&exe, &log)?;
+            println!(
+                "Installed. The sampler runs at login and checks memory every {}s.",
+                Config::load().interval_sec
+            );
+            println!("  config:  {}", config::path().display());
+            println!("  history: {}", history::dir().display());
+            println!("  log:     {log}");
+            println!("Run `ramster report` after a few hours to see your usage pattern.");
+        }
+        "uninstall" => {
+            service::uninstall()?;
+            println!(
+                "Uninstalled. History is kept in {}",
+                history::dir().display()
+            );
+        }
+        "status" => {
+            let pid = match (service::installed(), service::running_pid()) {
+                (_, Some(pid)) if pid > 0 => pid,
+                (true, _) => {
+                    println!(
+                        "Installed, but not running right now. Check: {}",
+                        service::HINT
+                    );
+                    return Ok(());
+                }
+                (false, _) => {
+                    println!("Not installed. Install with: ramster agent install");
+                    return Ok(());
+                }
+            };
+            println!("Running (pid {pid}).");
+            if let Some(p) = probe::procs()?.into_iter().find(|p| p.pid == pid) {
+                println!(
+                    "  daemon memory: {:.1} MB",
+                    p.footprint as f64 / (1u64 << 20) as f64
+                );
+            }
+            println!(
+                "  samples in the last 24h: {}",
+                history::load(now_unix() - 86_400).len()
+            );
+            println!("  config: {}", config::path().display());
+        }
+        _ => return Err("usage: ramster agent install|uninstall|status".into()),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod service {
+    use std::time::{Duration, Instant};
+
+    use super::LABEL;
+    use crate::util::{run, uid};
+
+    fn domain() -> String {
+        format!("gui/{}", uid())
+    }
+
+    fn target() -> String {
+        format!("{}/{LABEL}", domain())
+    }
+
+    /// `bootout` returns before the old job is torn down; wait until launchd
+    /// forgets the service so an immediate `bootstrap` doesn't fail with EIO.
+    fn bootout_and_wait(service: &str) {
+        if !run(Duration::from_secs(5), "launchctl", &["print", service]).0 {
+            return; // not loaded
+        }
+        let _ = run(Duration::from_secs(10), "launchctl", &["bootout", service]);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline
+            && run(Duration::from_secs(5), "launchctl", &["print", service]).0
+        {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+
+    fn bootstrap_with_retry(domain: &str, plist: &str) -> Result<(), String> {
+        let mut last = String::new();
+        for attempt in 0..5 {
+            let (ok, out) = run(
+                Duration::from_secs(10),
+                "launchctl",
+                &["bootstrap", domain, plist],
+            );
+            if ok {
+                return Ok(());
+            }
+            last = out;
+            std::thread::sleep(Duration::from_millis(300 * (attempt + 1)));
+        }
+        Err(format!("launchctl bootstrap: {last}"))
+    }
+
+    fn plist_path() -> String {
+        format!("{}/Library/LaunchAgents/{LABEL}.plist", crate::util::home())
+    }
+
+    fn xml_escape(s: &str) -> String {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+    }
+
+    pub const HINT: &str =
+        "launchctl print gui/$(id -u)/dev.ramster.daemon, and ~/.ramster/daemon.log";
+
+    pub fn installed() -> bool {
+        std::path::Path::new(&plist_path()).exists()
+    }
+
+    pub fn install(exe: &str, log: &str) -> Result<(), String> {
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -281,64 +372,176 @@ pub fn cmd_agent(sub: &str, exe: Option<std::path::PathBuf>) -> Result<(), Strin
 </dict>
 </plist>
 "#,
-                exe = xml_escape(&exe),
-                log = xml_escape(&log)
-            );
-            let path = plist_path();
-            if let Some(dir) = std::path::Path::new(&path).parent() {
-                std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-            }
-            bootout_and_wait(&service);
-            std::fs::write(&path, plist).map_err(|e| e.to_string())?;
-            bootstrap_with_retry(&domain, &path)?;
-            println!(
-                "Installed. The sampler runs at login and checks memory every {}s.",
-                Config::load().interval_sec
-            );
-            println!("  config:  {}", config::path().display());
-            println!("  history: {}", history::dir().display());
-            println!("  log:     {log}");
-            println!("Run `ramster report` after a few hours to see your usage pattern.");
+            exe = xml_escape(exe),
+            log = xml_escape(log)
+        );
+        let path = plist_path();
+        if let Some(dir) = std::path::Path::new(&path).parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        "uninstall" => {
-            bootout_and_wait(&service);
-            match std::fs::remove_file(plist_path()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.to_string()),
-            }
-            println!(
-                "Uninstalled. History is kept in {}",
-                history::dir().display()
-            );
+        bootout_and_wait(&target());
+        std::fs::write(&path, plist).map_err(|e| e.to_string())?;
+        bootstrap_with_retry(&domain(), &path)
+    }
+
+    pub fn uninstall() -> Result<(), String> {
+        bootout_and_wait(&target());
+        match std::fs::remove_file(plist_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.to_string()),
         }
-        "status" => {
-            let (ok, out) = run(Duration::from_secs(5), "launchctl", &["print", &service]);
-            if !ok {
-                println!("Not running. Install with: ramster agent install");
-                return Ok(());
-            }
-            let pid: i32 = out
-                .lines()
+    }
+
+    /// Some(pid) when launchd has the job loaded (pid 0 if not running right now).
+    pub fn running_pid() -> Option<i32> {
+        let (ok, out) = run(Duration::from_secs(5), "launchctl", &["print", &target()]);
+        ok.then(|| {
+            out.lines()
                 .find_map(|l| l.trim().strip_prefix("pid = "))
                 .and_then(|v| v.trim().parse().ok())
-                .unwrap_or(0);
-            println!("Running (pid {pid}).");
-            if pid > 0 {
-                if let Some(p) = probe::procs()?.into_iter().find(|p| p.pid == pid) {
-                    println!(
-                        "  daemon memory: {:.1} MB",
-                        p.footprint as f64 / (1u64 << 20) as f64
-                    );
-                }
-            }
-            println!(
-                "  samples in the last 24h: {}",
-                history::load(now_unix() - 86_400).len()
-            );
-            println!("  config: {}", config::path().display());
-        }
-        _ => return Err("usage: ramster agent install|uninstall|status".into()),
+                .unwrap_or(0)
+        })
     }
-    Ok(())
+}
+
+/// A systemd user unit: runs at login, restarts if it dies, low priority.
+#[cfg(any(target_os = "linux", test))]
+pub fn systemd_unit(exe: &str, log: &str) -> String {
+    // systemd unit syntax: quote the command path, escape `\` and `"`, double
+    // `%` (specifiers) and `$` (ExecStart expands $VAR).
+    let q = |s: &str| {
+        format!(
+            "\"{}\"",
+            s.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('%', "%%")
+                .replace('$', "$$")
+        )
+    };
+    let raw = |s: &str| s.replace('%', "%%");
+    format!(
+        "[Unit]
+Description=ramster memory sampler
+Documentation=https://github.com/wasborntobeawesome/ramster
+
+[Service]
+ExecStart={} daemon
+Restart=always
+RestartSec=10
+Nice=10
+IOSchedulingClass=idle
+StandardOutput=append:{}
+StandardError=append:{}
+
+[Install]
+WantedBy=default.target
+",
+        q(exe),
+        raw(log),
+        raw(log)
+    )
+}
+
+#[cfg(target_os = "linux")]
+mod service {
+    use std::time::Duration;
+
+    use crate::util::run;
+
+    const UNIT: &str = "ramster.service";
+
+    fn unit_path() -> std::path::PathBuf {
+        let base = match std::env::var("XDG_CONFIG_HOME") {
+            Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+            _ => std::path::Path::new(&crate::util::home()).join(".config"),
+        };
+        base.join("systemd/user").join(UNIT)
+    }
+
+    fn systemctl(args: &[&str]) -> Result<String, String> {
+        let mut all = vec!["--user"];
+        all.extend_from_slice(args);
+        match run(Duration::from_secs(20), "systemctl", &all) {
+            (true, out) => Ok(out),
+            (false, out) => Err(format!("systemctl --user {}: {out}", args.join(" "))),
+        }
+    }
+
+    pub const HINT: &str = "systemctl --user status ramster, and ~/.ramster/daemon.log";
+
+    pub fn installed() -> bool {
+        unit_path().exists()
+    }
+
+    pub fn install(exe: &str, log: &str) -> Result<(), String> {
+        let path = unit_path();
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, super::systemd_unit(exe, log)).map_err(|e| e.to_string())?;
+        let started = systemctl(&["daemon-reload"])
+            .and_then(|_| systemctl(&["enable", UNIT]))
+            .and_then(|_| systemctl(&["restart", UNIT]));
+        if let Err(e) = started {
+            // Don't leave a unit behind that makes us look installed.
+            let _ = std::fs::remove_file(&path);
+            let _ = systemctl(&["daemon-reload"]);
+            return Err(format!(
+                "{e}\n(is there a systemd user session? `systemctl --user status` should work)"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn uninstall() -> Result<(), String> {
+        if installed() {
+            let _ = systemctl(&["disable", "--now", UNIT]);
+            std::fs::remove_file(unit_path()).map_err(|e| e.to_string())?;
+            let _ = systemctl(&["daemon-reload"]);
+        }
+        Ok(())
+    }
+
+    pub fn running_pid() -> Option<i32> {
+        let out = systemctl(&["show", "--property=MainPID", "--value", UNIT]).ok()?;
+        out.trim().parse::<i32>().ok().filter(|&p| p > 0)
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+mod service {
+    const NO: &str = "the background sampler needs launchd (macOS) or systemd (Linux)";
+    pub const HINT: &str = NO;
+    pub fn installed() -> bool {
+        false
+    }
+    pub fn install(_exe: &str, _log: &str) -> Result<(), String> {
+        Err(NO.into())
+    }
+    pub fn uninstall() -> Result<(), String> {
+        Ok(())
+    }
+    pub fn running_pid() -> Option<i32> {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn systemd_unit_quotes_paths() {
+        let u = systemd_unit("/home/me/My Tools/ramster", "/home/me/.ramster/daemon.log");
+        assert!(
+            u.contains("ExecStart=\"/home/me/My Tools/ramster\" daemon\n"),
+            "{u}"
+        );
+        assert!(u.contains("StandardOutput=append:/home/me/.ramster/daemon.log\n"));
+        assert!(u.contains("WantedBy=default.target"));
+        assert!(systemd_unit("/x/100%/ramster", "/l").contains("ExecStart=\"/x/100%%/ramster\""));
+        assert!(systemd_unit("/home/me/$tools/ramster", "/l")
+            .contains("ExecStart=\"/home/me/$$tools/ramster\" daemon"));
+    }
 }

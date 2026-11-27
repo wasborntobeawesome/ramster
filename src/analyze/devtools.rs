@@ -210,9 +210,9 @@ fn lm_studio(c: &Ctx) -> Vec<Finding> {
         frees_mb: frees,
         action,
         tip: "LM Studio can unload models on its own: turn on the idle TTL (Developer → Server settings → Auto unload unused JIT loaded models).".into(),
+        starts: c.starts_of(&g.pids),
         pids: g.pids.clone(),
         act,
-        ..Default::default()
     }]
 }
 
@@ -389,7 +389,7 @@ pub(super) fn extension_hosts(c: &Ctx) -> Vec<Finding> {
                 .filter(|p| !is_extension_host(p) && p.footprint >= 100 << 20)
                 .map(|p| (child_label(p), p.footprint >> 20))
                 .collect();
-            heavy.sort_by(|a, b| b.1.cmp(&a.1));
+            heavy.sort_by_key(|h| std::cmp::Reverse(h.1));
             let mut detail = format!("{hosts} window(s)");
             if !heavy.is_empty() {
                 let top: Vec<String> = heavy
@@ -412,7 +412,7 @@ pub(super) fn extension_hosts(c: &Ctx) -> Vec<Finding> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.frees_mb.cmp(&a.frees_mb));
+    out.sort_by_key(|f| std::cmp::Reverse(f.frees_mb));
     out
 }
 
