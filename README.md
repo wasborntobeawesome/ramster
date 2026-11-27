@@ -1,7 +1,7 @@
 # ramster
 
 **What is eating your RAM, and how to get it back.** Built for developers who run several AI agents,
-build daemons, emulators, Docker and three browsers on one Mac at the same time.
+build daemons, emulators, Docker and three browsers on one Mac (or Linux box) at the same time.
 
 - **Sees memory the way macOS does**: footprint plus compressed memory (Activity Monitor's number), not RSS,
   with helpers grouped under their app (WebKit tabs → Safari, the Docker VM → Docker, MCP servers → AI agents).
@@ -30,10 +30,13 @@ cargo install ramster
 make install                 # → ~/.local/bin/ramster (override with PREFIX=...)
 
 ramster setup                # optional: let your AI agents use it (MCP), asks per step
-ramster agent install        # optional: background sampler at login (launchd)
+ramster agent install        # optional: background sampler at login (launchd / systemd)
 ```
 
-Requires macOS (Apple Silicon or Intel); building needs Rust 1.82+. Linux is on the roadmap ([PLAN.md](PLAN.md)).
+Runs on macOS (Apple Silicon or Intel) and Linux (x86_64, arm64; kernel 4.20+ for pressure via PSI);
+building needs Rust 1.82+. On Linux, download the static `ramster-<version>-linux-<arch>.tar.gz` from the
+[releases](https://github.com/wasborntobeawesome/ramster/releases), or `cargo install ramster`. The menu bar
+app is macOS only.
 
 ## Menu bar app
 
@@ -160,7 +163,10 @@ Before starting memory-heavy work (Gradle/Xcode builds, emulators, Docker, big t
 
 ## Background sampler
 
-`ramster agent install` writes `~/Library/LaunchAgents/dev.ramster.daemon.plist` and starts `ramster daemon`.
+`ramster agent install` starts `ramster daemon` at login: on macOS through
+`~/Library/LaunchAgents/dev.ramster.daemon.plist`, on Linux as the systemd user service
+`~/.config/systemd/user/ramster.service` (`systemctl --user status ramster`). Notifications use
+`notify-send` on Linux.
 
 - Samples every 60 s; ~4.6 MB footprint, a few ms of CPU per sample, low-priority I/O.
 - History: `~/.ramster/history/YYYY-MM-DD.ndjson`, about 3 MB a day, kept 7 days. Finished days are
@@ -232,6 +238,20 @@ what loaded and points at mistakes; the daemon picks up changes on its next chec
   their own name.
 - **System**: `host_statistics64` (app, wired, compressed, cached), `vm.swapusage`, `kern.memorystatus_vm_pressure_level`.
 
+On Linux, everything comes from `/proc` and `/sys`, without subprocesses:
+
+- **Per process**: PSS + SwapPss from `/proc/<pid>/smaps_rollup` (shared pages split between the processes
+  that share them, plus swapped-out memory: the closest match to macOS's footprint), CPU and start time
+  from `/proc/<pid>/stat`.
+- **Grouping**: the systemd scope or service a process runs in, which desktop launchers create per app
+  (`app-gnome-firefox-1234.scope`, Flatpak and Snap scopes), so browser helpers group under their browser.
+  Processes adopted by `systemd --user` after their terminal or agent exited count as orphans, as
+  processes adopted by launchd do on macOS; systemd services and D-Bus activated processes are managed,
+  never orphans.
+- **System**: `/proc/meminfo` (used = total − available), zswap and zram for compressed memory, and PSI
+  (`/proc/pressure/memory`) for pressure: warning when tasks stall on memory more than ~5% of the last
+  minute, critical when everything stalls. Without PSI, available memory below 15% / 5%.
+
 Processes owned by other users (root daemons, WindowServer) show up in the system totals but not per process,
 unless you run ramster as root.
 
@@ -278,8 +298,8 @@ make dist [NOTARIZE=1]                           # dist/: CLI tarball, app zip, 
 make icon                                        # regenerate packaging/ramster.icns
 ```
 
-Layout: `src/lib.rs` (core library), `src/probe` (OS backend), `src/analyze` (grouping, rules in
-`rules.rs` and `devtools.rs`, rules.d in `custom.rs`, actions, report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd), `src/history.rs`, `src/ui.rs` (terminal output),
+Layout: `src/lib.rs` (core library), `src/probe` (OS backends: `macos.rs`, `linux.rs` + `procfs.rs` parsers), `src/analyze` (grouping, rules in
+`rules.rs` and `devtools.rs`, rules.d in `custom.rs`, actions, report), `src/mcp.rs`, `src/daemon.rs` (sampler + launchd/systemd), `src/history.rs`, `src/ui.rs` (terminal output),
 `src/main.rs` (CLI), `src/setup.rs` (`ramster setup`), `src/bin/ramster-bar.rs` (menu bar app),
 `packaging/` (Info.plist, icon generator, Homebrew formula and cask), `contrib/rules.d` (example rule packs),
 `.github/workflows/` (CI, release).

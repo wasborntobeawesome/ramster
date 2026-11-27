@@ -286,6 +286,9 @@ impl Snapshot {
         if let Some(n) = app_name(&p.path) {
             return (n.to_string(), true);
         }
+        if !p.app.is_empty() {
+            return (p.app.clone(), true); // Linux: the app's systemd scope
+        }
         // Helpers launched with responsibility disclaimed (common for IDE and
         // agent spawns) report themselves; fall back to the nearest app ancestor.
         let mut cur = self.proc(p.ppid);
@@ -499,6 +502,8 @@ pub fn is_system_path(path: &str) -> bool {
         "/usr/libexec/",
         "/usr/sbin/",
         "/sbin/",
+        "/usr/lib/systemd/",
+        "/lib/systemd/",
         "/Library/Apple/",
         "/Library/Developer/PrivateFrameworks/",
         "/Library/SystemExtensions/",

@@ -35,6 +35,20 @@ pub fn execute(f: &Finding, force: bool) -> Outcome {
             }
             r.message = format!("ran: {}", cmd.join(" "));
         }
+        #[cfg(not(target_os = "macos"))]
+        Action::Quit(app) => {
+            // No AppleScript: ask the app's top-level processes to exit, as closing
+            // its windows would. Helpers follow their parent.
+            let set: std::collections::HashSet<i32> = f.pids.iter().copied().collect();
+            let mut top = f.clone();
+            top.pids.retain(|&p| !set.contains(&probe::parent_of(p)));
+            let mut o = terminate(&top, force);
+            if o.ok {
+                o.message = format!("asked {app} to quit (SIGTERM)");
+            }
+            return o;
+        }
+        #[cfg(target_os = "macos")]
         Action::Quit(app) => {
             let script = format!("tell application {} to quit", applescript_str(app));
             let (ok, out) = run(Duration::from_secs(30), "osascript", &["-e", &script]);
@@ -51,6 +65,7 @@ pub fn execute(f: &Finding, force: bool) -> Outcome {
     r
 }
 
+#[cfg(target_os = "macos")]
 fn applescript_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }

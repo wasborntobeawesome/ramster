@@ -585,6 +585,7 @@ fn detached_user_proc(p: &Proc, me: u32, now: i64) -> bool {
         && p.uid == me
         && p.readable
         && !p.path.contains(".app/Contents/")
+        && p.app.is_empty() // a desktop app (Linux), not a forgotten tool
         && !is_system_path(&p.path)
         // Build daemons, emulators and nx/turbo have their own rules. Dev servers,
         // test runners and LLM servers do too, but only above their thresholds,

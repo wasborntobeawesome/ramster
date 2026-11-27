@@ -4,7 +4,7 @@
 //! <mach/vm_statistics.h>; sizes are checked at runtime against the kernel's
 //! return values, so a layout mismatch degrades to "unreadable", never UB.
 
-use super::{Mem, Proc};
+use super::{clip, Mem, Proc};
 use libc::{c_char, c_int, c_void};
 use std::ffi::CStr;
 use std::sync::OnceLock;
@@ -19,7 +19,6 @@ const KERN_PROCARGS2: c_int = 49;
 const HOST_VM_INFO64: c_int = 4;
 const MAXCOMLEN: usize = 16;
 const MAXPATHLEN: usize = 1024;
-const ARGS_KEEP: usize = 4096;
 
 #[repr(C)]
 struct ProcBsdInfo {
@@ -299,29 +298,6 @@ fn args_of(pid: c_int, buf: &mut [u8]) -> String {
     clip(&String::from_utf8_lossy(&s))
 }
 
-/// Keep head and tail of huge command lines: main class and flags live at the ends.
-fn clip(s: &str) -> String {
-    if s.len() <= ARGS_KEEP {
-        return s.to_string();
-    }
-    let head_end = floor_char(s, ARGS_KEEP * 5 / 8);
-    let tail_start = ceil_char(s, s.len() - ARGS_KEEP * 3 / 8);
-    format!("{} … {}", &s[..head_end], &s[tail_start..])
-}
-
-fn floor_char(s: &str, mut i: usize) -> usize {
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    i
-}
-fn ceil_char(s: &str, mut i: usize) -> usize {
-    while !s.is_char_boundary(i) {
-        i += 1;
-    }
-    i
-}
-
 fn argmax() -> usize {
     let mut v: c_int = 0;
     let mut sz = std::mem::size_of::<c_int>();
@@ -458,6 +434,10 @@ pub fn start_time(pid: i32) -> i64 {
         Some(b) => b.start,
         None => -1,
     }
+}
+
+pub fn parent_of(pid: i32) -> i32 {
+    basic(pid).map(|b| b.ppid).unwrap_or(0)
 }
 
 #[cfg(test)]

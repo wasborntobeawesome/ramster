@@ -66,8 +66,12 @@ proc-janitor's grace period (we require 2 min of age).
   the downloaded app zip and a cask open without a Gatekeeper warning
 
 ### v0.3: other platforms
-- Linux backend (`sysinfo` or `procfs`): `/proc/*/smaps_rollup` (PSS), `/proc/pressure/memory` (PSI) for pressure, cgroup v2 per systemd unit;
-  systemd user service instead of launchd; `systemctl --user stop` actions
+- Linux backend (done): `/proc` and `/sys` read directly (no `sysinfo`/`procfs` crates, same as the macOS
+  side reads the kernel): PSS + SwapPss from `smaps_rollup`, PSI for pressure, zswap/zram for compressed
+  memory, apps grouped by their systemd scope, orphans adopted by `systemd --user` treated like launchd's;
+  systemd user service for the sampler, `notify-send` notifications, SIGTERM instead of AppleScript quit.
+  Static musl binaries for x86_64 and arm64 in releases; CI runs on Linux too.
+  Not yet: Electron and VS Code extension-host detection on Linux (they look for macOS bundles).
 - Windows backend (working set / private bytes, `taskkill`), lower priority
 
 ### v0.4: smarter

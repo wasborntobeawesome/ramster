@@ -107,7 +107,20 @@ fn gather(need: Need) -> Facts {
     f
 }
 
+/// Linux: systemd services and D-Bus activated processes, read from /proc.
+#[cfg(target_os = "linux")]
+fn launchd_pids() -> HashSet<i32> {
+    crate::probe::linux::managed_pids()
+}
+
+/// Linux: /proc/net/tcp listeners matched to our processes' sockets (no lsof needed).
+#[cfg(target_os = "linux")]
+fn listening_pids() -> HashSet<i32> {
+    crate::probe::linux::listening_pids()
+}
+
 /// `launchctl list`: "PID\tStatus\tLabel" per job; PID is "-" when not running.
+#[cfg(not(target_os = "linux"))]
 fn launchd_pids() -> HashSet<i32> {
     let (ok, out) = run(Duration::from_secs(5), "launchctl", &["list"]);
     if !ok {
@@ -124,6 +137,7 @@ pub fn parse_launchctl_list(out: &str) -> HashSet<i32> {
 }
 
 /// One lsof call for every listening TCP socket we can see (our own processes).
+#[cfg(not(target_os = "linux"))]
 fn listening_pids() -> HashSet<i32> {
     let lsof = which("lsof", &["/usr/sbin/lsof"]).unwrap_or_else(|| "lsof".into());
     let (_, out) = run(

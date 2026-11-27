@@ -1,5 +1,5 @@
 //! Raw process and memory data from the OS. Each platform provides
-//! `procs`, `memory`, `cwd` and `start_time`.
+//! `procs`, `memory`, `cwd`, `start_time` and `parent_of`.
 
 use serde::Serialize;
 
@@ -25,6 +25,10 @@ pub struct Proc {
     pub resp_pid: i32,
     /// False when the footprint could not be read (another user's process).
     pub readable: bool,
+    /// Desktop app the process belongs to when the OS says so directly
+    /// (Linux: its systemd scope). macOS groups by .app bundle and leaves it empty.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub app: String,
 }
 
 /// System-wide memory. All sizes in bytes.
@@ -56,12 +60,38 @@ pub fn pressure_name(level: i32) -> &'static str {
     }
 }
 
+const ARGS_KEEP: usize = 4096;
+
+/// Keep head and tail of huge command lines: main class and flags live at the ends.
+pub(crate) fn clip(s: &str) -> String {
+    if s.len() <= ARGS_KEEP {
+        return s.to_string();
+    }
+    let mut head_end = ARGS_KEEP * 5 / 8;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - ARGS_KEEP * 3 / 8;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{} … {}", &s[..head_end], &s[tail_start..])
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub mod procfs;
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
-pub use macos::{cwd, memory, procs, start_time};
+pub use macos::{cwd, memory, parent_of, procs, start_time};
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{cwd, memory, parent_of, procs, start_time};
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod other;
-#[cfg(not(target_os = "macos"))]
-pub use other::{cwd, memory, procs, start_time};
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+pub use other::{cwd, memory, parent_of, procs, start_time};
